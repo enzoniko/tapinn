@@ -1,0 +1,22 @@
+# Repository Cleanup (NeurIPS 2026)
+legacy/
+neurips_results/**/run_full.log
+neurips_results/**/run_multi_prob.log
+*.log
+
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# OS Files
+.DS_Store
+Thumbs.db
