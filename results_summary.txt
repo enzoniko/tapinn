@@ -1,0 +1,51 @@
+
+--- EXP 1: ODE Chaos Suite ---
+                        data_mse_mean  physics_residual_mean
+problem  model                                              
+duffing  deeponet            0.295823               0.077535
+         fno                 0.227598               0.131312
+         hyperpinn           0.477085               0.055232
+         standard_pinn       0.491734               0.047840
+         tapinn              0.360128               0.072101
+kuramoto deeponet            1.936633               0.525220
+         fno                 1.820902               1.120430
+         hyperpinn           5.129612               0.458370
+         standard_pinn       5.044959               0.499041
+         tapinn              3.946942               0.410797
+lorenz   deeponet           52.160758              93.077562
+         fno                23.561412            1389.761223
+         hyperpinn          92.749617              72.690420
+         standard_pinn     109.974341             437.780630
+         tapinn            111.195615             461.901170
+
+--- EXP 2: PDE Spatiotemporal Suite ---
+                                    data_mse_mean  physics_residual_mean
+problem              model                                              
+allen_cahn           deeponet            0.126727               0.041464
+                     fno                 0.064092              15.332887
+                     hyperpinn           0.072377               0.013204
+                     standard_pinn       0.130249               0.023372
+                     tapinn              0.199377               0.062379
+burgers              deeponet            0.068092               0.243313
+                     fno                 0.032955               6.687142
+                     hyperpinn           0.066256               0.656132
+                     standard_pinn       0.075243               0.420824
+                     tapinn              0.091636               1.132613
+kuramoto_sivashinsky deeponet            0.003202               0.017544
+                     fno                 0.008062               0.614873
+                     hyperpinn           0.007544               0.021152
+                     standard_pinn       0.008062               0.035080
+                     tapinn              0.010296               0.070853
+
+--- EXP 3: Baselines & Capacity ---
+      model_name  param_count  data_mse_mean  physics_residual_mean
+0         tapinn         8426       0.313323               0.064167
+1   tapinn_large        39106       0.283294               0.062151
+2      hyperpinn        40258       0.287507               0.037578
+3  hyper_lr_pinn        71886       0.290395               0.036885
+4       deeponet        19392       0.225112               0.066240
+5            fno        29186       0.169870               3.385428
+
+--- EXP 4: Sensitivity & Robustness ---
+
+--- EXP 5: Theoretical Optimization Landscape ---

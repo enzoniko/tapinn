@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.func import functional_call, vmap, jacrev
 from torch.utils.data import DataLoader, TensorDataset
 
 from .problems import compute_ode_residual, compute_pde_residual
@@ -27,6 +28,8 @@ class TrainResult:
     seconds_per_epoch: float
     epochs_trained: int = 0
     best_val_loss: float = float("inf")
+    ntk_eigenvalues: list[dict] = field(default_factory=list)
+    jacobian_conditions: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +134,88 @@ def prepare_pde_tensors(system_data, observation_steps: int) -> tuple[torch.Tens
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def compute_ntk_spectrum(model, coords):
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    def fmodel(params, buffers, x):
+        return functional_call(model, (params, buffers), (x.unsqueeze(0),))
+
+    jacobian_fn = vmap(jacrev(fmodel, argnums=0), in_dims=(None, None, 0))
+    jac_dict = jacobian_fn(params, buffers, coords)
+
+    J = torch.cat([j.flatten(start_dim=1) for j in jac_dict.values()], dim=1)
+
+    K = J @ J.T
+    eigvals = torch.linalg.eigvalsh(K)
+    return eigvals
+
+def compute_jacobian_condition(residual_fn, model, coords):
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+
+    jac_fn = jacrev(residual_fn, argnums=0)
+    jac_dict = jac_fn(params, buffers, coords)
+
+    J = torch.cat([j.flatten(start_dim=1) for j in jac_dict.values()], dim=1)
+
+    s = torch.linalg.svdvals(J)
+    return s.max() / max(s.min().item(), 1e-12)
+
+def lipschitz_estimate(encoder, x):
+    from torch.autograd.functional import jacobian
+    # Must use train() to allow cuDNN LSTM backward passes
+    encoder.train()
+    
+    norms = []
+    # Use standard jacobian in a loop to avoid cuDNN LSTM flatten_parameters bug under torch.func
+    for i in range(x.shape[0]):
+        x_i = x[i:i+1]
+        def f(inp):
+            return encoder(inp)
+        
+        J = jacobian(f, x_i, vectorize=False)
+        J = J.view(J.shape[1], -1)  # Reshape to (out_dim, flattened_in_dim)
+        norm = torch.linalg.matrix_norm(J, ord=2)
+        norms.append(norm)
+        
+    if not norms:
+        return torch.tensor(0.0, device=x.device)
+        
+    return torch.stack(norms).max()
+
+class ConFIGOptimizer:
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
+    
+    def config_update(self, g1, g2):
+        dot = torch.dot(g1, g2)
+        if dot >= 0:
+            return g1 + g2
+        correction = (-dot / max(torch.norm(g2).item() ** 2, 1e-12)) * g2
+        return g1 + correction
+
+    def step(self, loss1, loss2, model_parameters):
+        params = [p for p in model_parameters if p.requires_grad]
+        g1 = torch.autograd.grad(loss1, params, retain_graph=True, allow_unused=True)
+        g2 = torch.autograd.grad(loss2, params, allow_unused=True)
+        
+        for p, g1_n, g2_n in zip(params, g1, g2):
+            if g1_n is None and g2_n is None:
+                continue
+            if g1_n is None:
+                p.grad = g2_n.clone()
+            elif g2_n is None:
+                p.grad = g1_n.clone()
+            else:
+                p.grad = self.config_update(g1_n.reshape(-1), g2_n.reshape(-1)).view_as(p)
+
+        self.optimizer.step()
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
 
 def _triplet_loss(latent: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
     if latent.shape[0] < 3:
@@ -269,6 +354,8 @@ def train_tapinn(
     max_data_points: int = 128,
     max_phys_points: int = 64,
     progress_desc: str | None = None,
+    use_config: bool = False,
+    use_soap: bool = False,
     # --- callback arguments (all optional; default = disabled) ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
@@ -279,9 +366,19 @@ def train_tapinn(
     dataset = TensorDataset(*dataset_tensors)
     loader = DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=True)
     model = model.to(device)
-    optimizer_encoder = torch.optim.Adam(model.encoder.parameters(), lr=lr)
-    optimizer_generator = torch.optim.Adam(model.generator.parameters(), lr=lr)
-    optimizer_joint = torch.optim.Adam(model.parameters(), lr=lr * 0.75)
+    
+    if use_soap:
+        from .soap import SOAP
+        optimizer_encoder = SOAP(model.encoder.parameters(), lr=lr)
+        optimizer_generator = SOAP(model.generator.parameters(), lr=lr)
+        optimizer_joint = SOAP(model.parameters(), lr=lr * 0.75)
+    else:
+        optimizer_encoder = torch.optim.Adam(model.encoder.parameters(), lr=lr)
+        optimizer_generator = torch.optim.Adam(model.generator.parameters(), lr=lr)
+        optimizer_joint = torch.optim.Adam(model.parameters(), lr=lr * 0.75)
+        
+    config_opt_joint = ConFIGOptimizer(optimizer_joint) if use_config else None
+
     history = []
     total_time = 0.0
 
@@ -398,10 +495,14 @@ def train_tapinn(
                 else:
                     residual = compute_pde_residual(problem_name, flat_phys_coords, phys_pred[:, 0], phys_param)
                 physics_loss = torch.mean(residual**2)
+                
                 loss = data_loss + alpha_physics * physics_loss + beta_metric * metric_loss
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer_joint.step()
+                if use_config:
+                    config_opt_joint.step(data_loss, alpha_physics * physics_loss + beta_metric * metric_loss, model.parameters())
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer_joint.step()
 
             running["loss"] += float(loss.item())
             running["data_mse"] += float(data_loss.item())
@@ -456,6 +557,8 @@ def train_direct_model(
     max_data_points: int = 128,
     max_phys_points: int = 64,
     progress_desc: str | None = None,
+    use_config: bool = False,
+    use_soap: bool = False,
     # --- callback arguments ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
@@ -466,7 +569,14 @@ def train_direct_model(
     dataset = TensorDataset(*dataset_tensors)
     loader = DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=True)
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    if use_soap:
+        from .soap import SOAP
+        optimizer = SOAP(model.parameters(), lr=lr)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        
+    config_opt = ConFIGOptimizer(optimizer) if use_config else None
     history = []
     total_time = 0.0
 
@@ -542,9 +652,13 @@ def train_direct_model(
                 residual = compute_pde_residual(problem_name, flat_phys_coords, phys_pred[:, 0], phys_params)
             physics_loss = torch.mean(residual**2)
             loss = data_loss + alpha_physics * physics_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            
+            if use_config:
+                config_opt.step(data_loss, alpha_physics * physics_loss, model.parameters())
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             running["loss"] += float(loss.item())
             running["data_mse"] += float(data_loss.item())

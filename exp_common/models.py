@@ -146,6 +146,81 @@ class HyperPINN(nn.Module):
         return x
 
 
+class HyperLRPINN(nn.Module):
+    def __init__(self, coord_dim: int, output_dim: int, hidden_dim: int = 64, rank: int = 4):
+        super().__init__()
+        self.coord_dim = coord_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.rank = rank
+
+        # Static base weights and biases for the trunk
+        self.layer1 = nn.Linear(coord_dim, hidden_dim)
+        self.layer2 = nn.Linear(hidden_dim, hidden_dim)
+        self.layer3 = nn.Linear(hidden_dim, output_dim)
+
+        self.n_ab_params = (
+            rank * (hidden_dim + coord_dim) +
+            rank * (hidden_dim + hidden_dim) +
+            rank * (output_dim + hidden_dim)
+        )
+
+        self.hyper = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, self.n_ab_params),
+        )
+
+    def _unpack(self, vector: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        idx = 0
+        s1 = self.rank * self.coord_dim
+        a1 = vector[:, idx : idx + s1].reshape(-1, self.rank, self.coord_dim)
+        idx += s1
+        s2 = self.hidden_dim * self.rank
+        b1 = vector[:, idx : idx + s2].reshape(-1, self.hidden_dim, self.rank)
+        idx += s2
+
+        s3 = self.rank * self.hidden_dim
+        a2 = vector[:, idx : idx + s3].reshape(-1, self.rank, self.hidden_dim)
+        idx += s3
+        s4 = self.hidden_dim * self.rank
+        b2 = vector[:, idx : idx + s4].reshape(-1, self.hidden_dim, self.rank)
+        idx += s4
+
+        s5 = self.rank * self.hidden_dim
+        a3 = vector[:, idx : idx + s5].reshape(-1, self.rank, self.hidden_dim)
+        idx += s5
+        s6 = self.output_dim * self.rank
+        b3 = vector[:, idx : idx + s6].reshape(-1, self.output_dim, self.rank)
+        idx += s6
+
+        return a1, b1, a2, b2, a3, b3
+
+    def forward(self, coords: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+        if coords.dim() == 1:
+            coords = coords.unsqueeze(1)
+        if param.dim() == 1:
+            param = param.unsqueeze(1)
+            
+        generated = self.hyper(param)
+        a1, b1, a2, b2, a3, b3 = self._unpack(generated)
+
+        dw1 = torch.bmm(b1, a1)
+        dw2 = torch.bmm(b2, a2)
+        dw3 = torch.bmm(b3, a3)
+
+        w1 = self.layer1.weight.unsqueeze(0) + dw1
+        w2 = self.layer2.weight.unsqueeze(0) + dw2
+        w3 = self.layer3.weight.unsqueeze(0) + dw3
+
+        x = torch.bmm(coords.unsqueeze(1), w1.transpose(1, 2)).squeeze(1) + self.layer1.bias
+        x = torch.tanh(x)
+        x = torch.bmm(x.unsqueeze(1), w2.transpose(1, 2)).squeeze(1) + self.layer2.bias
+        x = torch.tanh(x)
+        x = torch.bmm(x.unsqueeze(1), w3.transpose(1, 2)).squeeze(1) + self.layer3.bias
+        return x
+
+
 class DeepONet(nn.Module):
     def __init__(self, branch_input_dim: int, coord_dim: int, output_dim: int, hidden_dim: int = 64, basis_dim: int = 32):
         super().__init__()
@@ -236,3 +311,8 @@ def build_tapinn(obs_dim: int, coord_dim: int, output_dim: int, large: bool = Fa
 
 def build_capacity_matched_hyperpinn(coord_dim: int, output_dim: int) -> HyperPINN:
     return HyperPINN(coord_dim=coord_dim, output_dim=output_dim, hidden_dim=HYPERPINN_MATCHED_HIDDEN_DIM)
+
+
+def build_low_rank_hyperpinn(coord_dim: int, output_dim: int, hidden_dim: int = 64, rank: int = 4) -> HyperLRPINN:
+    return HyperLRPINN(coord_dim=coord_dim, output_dim=output_dim, hidden_dim=hidden_dim, rank=rank)
+

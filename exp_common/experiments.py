@@ -17,6 +17,7 @@ from .models import (
     LightweightFNO1d,
     StandardPINN,
     build_capacity_matched_hyperpinn,
+    build_low_rank_hyperpinn,
     build_tapinn,
     count_parameters,
 )
@@ -1209,7 +1210,13 @@ def _finite_ntk_and_condition(model: nn.Module, model_kind: str, observations: t
     singular_vals = np.clip(singular_vals, 1e-12, None)
     condition_number = float(singular_vals.max() / singular_vals.min())
     
-    return eigvals.tolist(), condition_number
+    from exp_common.trainers import lipschitz_estimate
+    lipschitz = 0.0
+    if model_kind == "tapinn":
+        obs_b = observations[:diag_samples].to(device)
+        lipschitz = float(lipschitz_estimate(model.encoder, obs_b))
+        
+    return eigvals.tolist(), condition_number, lipschitz
 
 
 
@@ -1278,13 +1285,17 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
             test_meta  = _subset_optional_tensor(test_idx,  meta)
 
             models = {
-                "tapinn_ao":    ("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), True),
-                "tapinn_joint": ("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), False),
-                "standard_pinn":("direct", StandardPINN(coord_dim=coords.shape[-1], output_dim=targets.shape[-1], hidden_dim=64), None),
+                "tapinn_ao":    ("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), True, None),
+                "tapinn_joint": ("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), False, None),
+                "tapinn_config":("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), False, "config"),
+                "tapinn_soap":  ("tapinn", build_tapinn(obs_dim=obs.shape[-1], coord_dim=coords.shape[-1], output_dim=targets.shape[-1], large=False), False, "soap"),
+                "standard_pinn":("direct", StandardPINN(coord_dim=coords.shape[-1], output_dim=targets.shape[-1], hidden_dim=64), None, None),
             }
 
-            for model_name, (family, model, alternating) in models.items():
+            for model_name, (family, model, alternating, opt_type) in models.items():
                 model.to(device)
+                use_config = (opt_type == "config")
+                use_soap = (opt_type == "soap")
                 
                 # Landscape Captures
                 for epoch in range(0, total_epochs + 1, checkpoint_step):
@@ -1295,20 +1306,22 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
                                 model, problem_name, train_obs, train_coords, train_targets, train_params, 
                                 device, ode_metadata=train_meta, epochs=checkpoint_step, batch_size=4,
                                 alternating=bool(alternating), progress_desc=desc, val_bundle=None, callbacks=callbacks,
+                                use_config=use_config, use_soap=use_soap,
                             )
                         else:
                             train_direct_model(
                                 model, problem_name, "standard", train_obs, train_coords, train_targets, train_params, 
                                 device, ode_metadata=train_meta, epochs=checkpoint_step, batch_size=4,
                                 progress_desc=desc, val_bundle=None, callbacks=callbacks,
+                                use_config=use_config, use_soap=use_soap,
                             )
                     
-                    eigvals, condition_number = _finite_ntk_and_condition(
+                    eigvals, condition_number, lipschitz = _finite_ntk_and_condition(
                         model, "tapinn" if family == "tapinn" else "direct",
                         train_obs, train_coords, train_params, device
                     )
                     spectrum_records.append({"problem": problem_name, "model": model_name, "epoch": epoch, "eigenvalues": eigvals[:24]})
-                    condition_records.append({"problem": problem_name, "model": model_name, "epoch": epoch, "condition_number": condition_number})
+                    condition_records.append({"problem": problem_name, "model": model_name, "epoch": epoch, "condition_number": condition_number, "lipschitz": lipschitz})
 
                 # Final Accuracy Stats
                 if family == "tapinn":
@@ -1764,6 +1777,7 @@ _EXP3_MODELS = {
     "tapinn":        ("tapinn",       "physics_trained"),
     "tapinn_large":  ("tapinn_large", "physics_trained"),
     "hyperpinn":     ("hyper",        "physics_trained"),
+    "hyper_lr_pinn": ("hyper",        "physics_trained"),
     "deeponet":      ("deeponet",     "physics_trained"),
     "fno":           ("fno",          "supervised_only"),
 }
@@ -1787,6 +1801,7 @@ def _build_exp3_models(
         "tapinn":        build_tapinn(obs_dim=obs_dim, coord_dim=coord_dim, output_dim=output_dim, large=False),
         "tapinn_large":  build_tapinn(obs_dim=obs_dim, coord_dim=coord_dim, output_dim=output_dim, large=True),
         "hyperpinn":     build_capacity_matched_hyperpinn(coord_dim=coord_dim, output_dim=output_dim),
+        "hyper_lr_pinn": build_low_rank_hyperpinn(coord_dim=coord_dim, output_dim=output_dim, hidden_dim=64, rank=4),
         "deeponet":      DeepONet(branch_input_dim=branch_dim, coord_dim=coord_dim, output_dim=output_dim, hidden_dim=64, basis_dim=32),
         "fno":           LightweightFNO1d(branch_input_dim=branch_dim, grid_size=grid_size, output_dim=output_dim, width=fno_width, modes=4 if smoke_test else 12),
     }
@@ -1993,6 +2008,7 @@ def run_exp_3_sota_baselines_and_capacity(output_root: str, device_name: str, sm
         "tapinn":        count_parameters(build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=False)),
         "tapinn_large":  count_parameters(build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=True)),
         "hyperpinn":     count_parameters(build_capacity_matched_hyperpinn(coord_dim=1, output_dim=2)),
+        "hyper_lr_pinn": count_parameters(build_low_rank_hyperpinn(coord_dim=1, output_dim=2, hidden_dim=64, rank=4)),
         "deeponet":      count_parameters(DeepONet(branch_input_dim=20*2, coord_dim=1, output_dim=2, hidden_dim=64, basis_dim=32)),
         "fno":           count_parameters(LightweightFNO1d(branch_input_dim=20*2, grid_size=160, output_dim=2, width=32, modes=12)),
     }
