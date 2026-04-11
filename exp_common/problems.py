@@ -8,7 +8,7 @@ import torch
 from scipy.integrate import solve_ivp
 
 if TYPE_CHECKING:
-    from .trainers import StateNormalizer
+    from .trainers import CoordNormalizer, StateNormalizer
 
 
 @dataclass
@@ -412,14 +412,13 @@ def compute_ode_residual(
     y_pred: torch.Tensor,
     param: torch.Tensor,
     metadata: dict[str, torch.Tensor] | None = None,
-    coord_scale: float = 1.0,
+    coord_normalizer: "CoordNormalizer | None" = None,
     state_normalizer: "StateNormalizer | None" = None,
 ) -> torch.Tensor:
     """Compute the ODE physics residual in normalised space.
 
     When coordinates are normalised (``[-1, 1]``), ``torch.autograd.grad``
-    returns ``dy/dt_norm``.  Multiplying by ``coord_scale = 2/(t_max-t_min)``
-    recovers ``dy/dt_raw``.
+    returns ``dy/dt_norm``.  The physical derivative is ``dy/dt_raw``.
 
     When outputs are normalised, ``y_pred`` is in ``[-1, 1]``.  We
     denormalise it before evaluating the physical RHS, then renormalise the
@@ -427,7 +426,16 @@ def compute_ode_residual(
     """
     if coords.dim() == 1:
         coords = coords.unsqueeze(1)
-    t = coords[:, 0]
+
+    # Denormalise time for physical equations (forcing, etc)
+    if coord_normalizer is not None:
+        # coords shape is (N, 1) or similar.
+        t_raw = coord_normalizer.denormalize(coords)[:, 0]
+        # coord_scale = 2 / (t_max - t_min) => conveys dt_raw per dt_norm
+        coord_scale = float(coord_normalizer.coord_scales[0].item())
+    else:
+        t_raw = coords[:, 0]
+        coord_scale = 1.0
 
     # Compute dy_norm/dt_norm via autograd (shape: (N, state_dim))
     derivatives = []
@@ -436,7 +444,6 @@ def compute_ode_residual(
     dy_dt_norm = torch.stack(derivatives, dim=1)
 
     # Apply chain rule: dy_raw/dt_raw = (dy_norm/dt_norm) * coord_scale
-    # coord_scale = 2 / (t_max - t_min)  =>  conveys dt_raw per dt_norm
     dy_dt_raw = dy_dt_norm * coord_scale
 
     # Denormalise predictions for RHS evaluation
@@ -445,15 +452,19 @@ def compute_ode_residual(
     else:
         y_raw = y_pred
 
-    rhs_raw = ode_rhs_torch(problem_name, t, y_raw, param, metadata=metadata)
+    # Physics safety: clamp y_raw to prevent polynomial/chaotic terms from exploding
+    # in early training.
+    y_raw = torch.clamp(y_raw, min=-1000.0, max=1000.0)
+
+    # Eval RHS using physical time and physical state
+    rhs_raw = ode_rhs_torch(problem_name, t_raw, y_raw, param, metadata=metadata)
 
     # Re-normalise RHS to the same space as dy_dt_raw for a dimensionally
     # consistent residual.  Scale = (y_max - y_min) / 2 per dim.
     if state_normalizer is not None:
         state_scale = (state_normalizer.state_maxs - state_normalizer.state_mins).clamp(min=1e-6) / 2.0
         state_scale = state_scale.to(rhs_raw.device)
-        rhs_norm = rhs_raw / state_scale   # rhs_raw has units [y_raw / t_raw]; scale to norm
-        # residual = dy_dt_raw - rhs_norm, both in [normalised_y / raw_t]
+        rhs_norm = rhs_raw / state_scale
         return dy_dt_raw - rhs_norm
     return dy_dt_raw - rhs_raw
 

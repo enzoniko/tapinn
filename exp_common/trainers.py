@@ -138,6 +138,13 @@ class CoordNormalizer:
         ranges = (maxs - mins).clamp(min=1e-6)
         return 2.0 * (coords - mins) / ranges - 1.0
 
+    def denormalize(self, coords: torch.Tensor) -> torch.Tensor:
+        """Map coords from [-1, 1] back to raw space."""
+        mins = self.coord_mins.to(coords.device)
+        maxs = self.coord_maxs.to(coords.device)
+        ranges = (maxs - mins).clamp(min=1e-6)
+        return (coords + 1.0) * ranges / 2.0 + mins
+
 
 @dataclass
 class StateNormalizer:
@@ -188,8 +195,13 @@ def prepare_ode_tensors(
     raw_states = system_data.states  # (N, T, state_dim)
     num_samples, num_steps, _ = raw_states.shape
 
-    # Build raw observations from the first `observation_steps` time steps
-    observations = torch.tensor(raw_states[:, :observation_steps, :], dtype=torch.float32)
+    raw_targets = torch.tensor(raw_states, dtype=torch.float32)  # (N, T, state_dim)
+    state_norm = StateNormalizer.from_targets(raw_targets)
+    targets = state_norm.normalize(raw_targets)  # (N, T, state_dim) in [-1, 1]
+
+    # Build normalised observations from the first `observation_steps` time steps
+    raw_obs = torch.tensor(raw_states[:, :observation_steps, :], dtype=torch.float32)
+    observations = state_norm.normalize(raw_obs)
 
     # Raw coordinate grid: shape (N, T, 1)
     raw_coords_flat = torch.tensor(system_data.times[:, None], dtype=torch.float32)  # (T, 1)
@@ -198,10 +210,6 @@ def prepare_ode_tensors(
     coord_norm = CoordNormalizer.from_coords(raw_coords_flat)
     norm_times = coord_norm.normalize(raw_coords_flat)  # (T, 1) in [-1, 1]
     coords = norm_times.unsqueeze(0).expand(num_samples, -1, -1).clone()  # (N, T, 1)
-
-    raw_targets = torch.tensor(raw_states, dtype=torch.float32)  # (N, T, state_dim)
-    state_norm = StateNormalizer.from_targets(raw_targets)
-    targets = state_norm.normalize(raw_targets)  # (N, T, state_dim) in [-1, 1]
 
     params = torch.tensor(system_data.params, dtype=torch.float32)
     ode_metadata = None
@@ -242,7 +250,12 @@ def prepare_pde_tensors(
     raw_fields = system_data.fields  # (N, nt, nx)
     num_samples = raw_fields.shape[0]
 
-    observations = torch.tensor(raw_fields[:, :observation_steps, :], dtype=torch.float32)
+    raw_targets = torch.tensor(raw_fields.reshape(num_samples, -1, 1), dtype=torch.float32)
+    state_norm = StateNormalizer.from_targets(raw_targets)
+    targets = state_norm.normalize(raw_targets)
+
+    raw_obs = torch.tensor(raw_fields[:, :observation_steps, :], dtype=torch.float32)
+    observations = state_norm.normalize(raw_obs)
 
     mesh_t, mesh_x = np.meshgrid(system_data.times, system_data.space, indexing="ij")
     flat_coords = torch.tensor(
@@ -252,10 +265,6 @@ def prepare_pde_tensors(
     coord_norm = CoordNormalizer.from_coords(flat_coords)
     norm_flat = coord_norm.normalize(flat_coords)  # (nt*nx, 2)
     coords = norm_flat.unsqueeze(0).expand(num_samples, -1, -1).clone()  # (N, nt*nx, 2)
-
-    raw_targets = torch.tensor(raw_fields.reshape(num_samples, -1, 1), dtype=torch.float32)
-    state_norm = StateNormalizer.from_targets(raw_targets)
-    targets = state_norm.normalize(raw_targets)
 
     params = torch.tensor(system_data.params, dtype=torch.float32)
     return observations, coords, targets, params, coord_norm, state_norm
@@ -614,7 +623,7 @@ def train_tapinn(
                 # computes dy/dt_norm.  Scale by phys_t_scale to get dy/dt_raw.
                 residual_raw = compute_ode_residual(
                     problem_name, flat_phys_coords, phys_pred, phys_param,
-                    metadata=phys_metadata, coord_scale=phys_t_scale,
+                    metadata=phys_metadata, coord_normalizer=coord_normalizer,
                     state_normalizer=state_normalizer,
                 )
             else:
@@ -645,9 +654,12 @@ def train_tapinn(
                         g.detach().norm() ** 2 for g in g_phys if g is not None
                     ).sqrt().clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
+                    # Clamp lambda_hat *before* EMA to prevent singular exploding gradients
+                    # from permanently skewing the physics weight.
+                    lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
                 # EMA update: smooth so alpha doesn't oscillate
                 alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
-                # Clamp to [1e-3, 10.0] to avoid degenerate extremes
+                # Final clamp for redundancy
                 alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
 
             eff_alpha = alpha_phys_ema
@@ -713,16 +725,10 @@ def train_tapinn(
 
                 torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
                 torch.nn.utils.clip_grad_norm_(model.generator.parameters(), 1.0)
-                _opt_enc.step()
-                _opt_gen.step()
-
-                # Coupling step: use joint optimizer with already-computed grads
-                # (both enc and gen grads are already set above) to keep Adam
-                # joint state consistent. Scale down to avoid double-counting.
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(0.25)
-                optimizer_joint.step()
+                if enc_focus:
+                    _opt_enc.step()
+                else:
+                    _opt_gen.step()
 
             running["loss"]        += float(loss.item())
             running["data_mse"]    += float(data_loss.item())
@@ -885,7 +891,7 @@ def train_direct_model(
                     }
                 residual = compute_ode_residual(
                     problem_name, flat_phys_coords, phys_pred, phys_params,
-                    metadata=phys_metadata, coord_scale=phys_t_scale,
+                    metadata=phys_metadata, coord_normalizer=coord_normalizer,
                     state_normalizer=state_normalizer,
                 )
             else:
@@ -914,7 +920,10 @@ def train_direct_model(
                         g.detach().norm() ** 2 for g in g_phys if g is not None
                     ).sqrt().clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
+                    # Clamp lambda_hat *before* EMA
+                    lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
                 alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
+                # Final clamp for redundancy
                 alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
 
             eff_alpha = alpha_phys_ema

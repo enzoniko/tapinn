@@ -21,7 +21,7 @@ from .models import (
     build_tapinn,
     count_parameters,
 )
-from .plotting import configure_plotting, save_figure
+from .plotting import configure_plotting, get_model_color, moving_average, save_figure
 from .problems import (
     generate_allen_cahn_dataset,
     generate_burgers_dataset,
@@ -254,16 +254,15 @@ def _spectrum_plot(records: list[dict[str, object]], title: str, path: Path, pro
         stacked = np.array([np.pad(e, (0, max_len - len(e)), constant_values=np.nan) for e in eig_list])
         median_eigs = np.nanmedian(stacked, axis=0)
         ranks = np.arange(1, len(median_eigs) + 1)
-        col = prop_cycle[idx % len(prop_cycle)]
-        mk = markers[idx % len(markers)]
-        ax.plot(ranks, median_eigs, marker=mk, linewidth=1.6, color=col,
+        col = get_model_color(model_name)
+        ax.plot(ranks, median_eigs, marker="o", linewidth=1.6, color=col,
                 label=model_name, markevery=max(1, len(ranks)//8))
 
     ax.set_xlabel("Eigenvalue Rank")
     ax.set_ylabel("NTK Eigenvalue (median)")
     ax.set_yscale("log")
     ax.set_title(title)
-    ax.legend(loc="best", fontsize=8, framealpha=0.7)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     save_figure(fig, path)
 
 
@@ -286,20 +285,28 @@ def _condition_plot(records: list[dict[str, object]], title: str, path: Path, pr
         epochs_sorted = sorted(epoch_data.keys())
         means = np.array([np.mean(epoch_data[e]) for e in epochs_sorted])
         stds  = np.array([np.std(epoch_data[e])  for e in epochs_sorted])
-        col = prop_cycle[idx % len(prop_cycle)]
-        mk  = markers[idx % len(markers)]
-        ax.plot(epochs_sorted, means, marker=mk, linewidth=1.8, color=col,
-                label=model_name, markevery=max(1, len(epochs_sorted)//6))
-        ax.fill_between(epochs_sorted,
-                        np.maximum(means - stds, 1e-12),
-                        means + stds,
-                        color=col, alpha=0.18)
+        
+        # Smooth the trajectory for visual stability in reports
+        means_smoothed = moving_average(means, window=3)
+        # Adjust epochs to match smoothed length
+        epochs_trimmed = epochs_sorted[len(epochs_sorted) - len(means_smoothed):]
+        
+        col = get_model_color(model_name)
+        ax.plot(epochs_trimmed, means_smoothed, marker="o", linewidth=1.8, color=col,
+                label=model_name, markevery=max(1, len(epochs_trimmed)//6))
+        
+        # Match standard deviation shading to smoothed mean length
+        stds_trimmed = stds[len(stds) - len(means_smoothed):]
+        ax.fill_between(epochs_trimmed,
+                        np.maximum(means_smoothed - stds_trimmed, 1e-12),
+                        means_smoothed + stds_trimmed,
+                        color=col, alpha=0.15)
 
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Jacobian Condition Number (mean ± std)")
+    ax.set_ylabel("Jacobian Condition Number (smoothed mean ± std)")
     ax.set_yscale("log")
     ax.set_title(title)
-    ax.legend(loc="best", fontsize=8, framealpha=0.7)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     save_figure(fig, path)
 
 
@@ -333,8 +340,9 @@ def _final_conditioning_summary_plot(records: list[dict[str, object]], path: Pat
             final_conds.append(float(np.mean(subset)) if subset else 1.0)
 
         offsets = group_centers + (i - (n_models - 1) / 2.0) * bar_w
+        col = get_model_color(model_name)
         bars = ax.bar(offsets, final_conds, bar_w * 0.9,
-                      label=model_name, color=prop_cycle[i % len(prop_cycle)])
+                      label=model_name, color=col)
         # Annotate bar tops
         for bar, val in zip(bars, final_conds):
             ax.text(
@@ -347,7 +355,7 @@ def _final_conditioning_summary_plot(records: list[dict[str, object]], path: Pat
     ax.set_title("Optimization Stability Across Case Studies")
     ax.set_xticks(group_centers)
     ax.set_xticklabels(problems, rotation=25, ha="right", fontsize=9)
-    ax.legend(loc="upper left", fontsize=8, framealpha=0.8)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     fig.tight_layout()
     save_figure(fig, path)
 

@@ -1,205 +1,325 @@
 {
-  "device": "cuda",
-  "smoke_test": true,
-  "max_epochs": 4,
+  "device": "cpu",
+  "smoke_test": false,
+  "max_epochs": 100,
   "noise_sweep": [
     {
       "problem": "duffing",
       "model": "tapinn",
       "noise_sigma": 0.0,
-      "data_mse_mean": 0.4243451952934265,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.03373598037925787,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.4472343623638153,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.21144002676010132,
+      "data_mse_std": 0.018655614505535677,
+      "physics_residual_mean": 0.05943309503130851,
+      "physics_residual_std": 0.002287133740905126,
+      "forecast_error_mean": 0.2135697692632675,
+      "forecast_error_std": 0.01957739191904465
     },
     {
       "problem": "duffing",
       "model": "fno",
       "noise_sigma": 0.0,
-      "data_mse_mean": 0.4120076298713684,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.030594859121118024,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.42718306183815,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.1210373431444168,
+      "data_mse_std": 0.033024418662660794,
+      "physics_residual_mean": 0.12745465774606995,
+      "physics_residual_std": 0.02008922076376334,
+      "forecast_error_mean": 0.1334843412041664,
+      "forecast_error_std": 0.036607119391416185
+    },
+    {
+      "problem": "duffing",
+      "model": "tapinn",
+      "noise_sigma": 0.05,
+      "data_mse_mean": 0.21145965158939362,
+      "data_mse_std": 0.018655839984925503,
+      "physics_residual_mean": 0.05964187468143183,
+      "physics_residual_std": 0.0026098973567708884,
+      "forecast_error_mean": 0.21361073851585388,
+      "forecast_error_std": 0.01954849038454661
+    },
+    {
+      "problem": "duffing",
+      "model": "fno",
+      "noise_sigma": 0.05,
+      "data_mse_mean": 0.1225285843014717,
+      "data_mse_std": 0.030524814587165817,
+      "physics_residual_mean": 0.12361899218775065,
+      "physics_residual_std": 0.01844477043766536,
+      "forecast_error_mean": 0.1348397061228752,
+      "forecast_error_std": 0.034031802108777556
     },
     {
       "problem": "duffing",
       "model": "tapinn",
       "noise_sigma": 0.1,
-      "data_mse_mean": 0.4251238703727722,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.0338890893299069,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.4480349123477936,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.2109001636505127,
+      "data_mse_std": 0.018276456545308295,
+      "physics_residual_mean": 0.059554814336245813,
+      "physics_residual_std": 0.0026486194319206733,
+      "forecast_error_mean": 0.2130747616291046,
+      "forecast_error_std": 0.01915076744262437
     },
     {
       "problem": "duffing",
       "model": "fno",
       "noise_sigma": 0.1,
-      "data_mse_mean": 0.41148248314857483,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.030482816431268593,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.4266296923160553,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.12218319922685623,
+      "data_mse_std": 0.03007049309810186,
+      "physics_residual_mean": 0.12235956033422604,
+      "physics_residual_std": 0.01735231101784855,
+      "forecast_error_mean": 0.13438741415739058,
+      "forecast_error_std": 0.03352980321089802
     },
     {
       "problem": "duffing",
       "model": "tapinn",
       "noise_sigma": 0.25,
-      "data_mse_mean": 0.42644184827804565,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.03413474862290133,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.4493837356567383,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.2120754212141037,
+      "data_mse_std": 0.017791010787508433,
+      "physics_residual_mean": 0.059638580592888096,
+      "physics_residual_std": 0.0025871859327514096,
+      "forecast_error_mean": 0.21421085596084594,
+      "forecast_error_std": 0.018835206544854557
     },
     {
       "problem": "duffing",
       "model": "fno",
       "noise_sigma": 0.25,
-      "data_mse_mean": 0.41070985794067383,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.03031791587050229,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.42580974102020264,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.11969574838876725,
+      "data_mse_std": 0.023423058998015743,
+      "physics_residual_mean": 0.12022877881788017,
+      "physics_residual_std": 0.01695067863089038,
+      "forecast_error_mean": 0.13137736320495605,
+      "forecast_error_std": 0.026146227986256067
+    },
+    {
+      "problem": "duffing",
+      "model": "tapinn",
+      "noise_sigma": 0.5,
+      "data_mse_mean": 0.2122563898563385,
+      "data_mse_std": 0.017643795449633272,
+      "physics_residual_mean": 0.06007379541779333,
+      "physics_residual_std": 0.0027429356614506895,
+      "forecast_error_mean": 0.2144165337085724,
+      "forecast_error_std": 0.018747452364597742
+    },
+    {
+      "problem": "duffing",
+      "model": "fno",
+      "noise_sigma": 0.5,
+      "data_mse_mean": 0.12458672523498535,
+      "data_mse_std": 0.015757792697303312,
+      "physics_residual_mean": 0.11479867870290689,
+      "physics_residual_std": 0.014744662076501042,
+      "forecast_error_mean": 0.13519550114870071,
+      "forecast_error_std": 0.016096185238898792
     },
     {
       "problem": "allen_cahn",
       "model": "tapinn",
       "noise_sigma": 0.0,
-      "data_mse_mean": 0.12422281503677368,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 1.0464551448822021,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.12410148233175278,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.24808281362056733,
+      "data_mse_std": 0.033983762921882384,
+      "physics_residual_mean": 0.11844447448849678,
+      "physics_residual_std": 0.10431501866084629,
+      "forecast_error_mean": 0.24856952726840972,
+      "forecast_error_std": 0.0340674465573073
     },
     {
       "problem": "allen_cahn",
       "model": "fno",
       "noise_sigma": 0.0,
-      "data_mse_mean": 0.328975111246109,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.010649937205016613,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.3295946717262268,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.032240509241819384,
+      "data_mse_std": 0.012818075410009698,
+      "physics_residual_mean": 7.62223744392395,
+      "physics_residual_std": 3.4572968765902186,
+      "forecast_error_mean": 0.03221692703664303,
+      "forecast_error_std": 0.012771624843308247
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "tapinn",
+      "noise_sigma": 0.05,
+      "data_mse_mean": 0.24799116849899291,
+      "data_mse_std": 0.034070974440338055,
+      "physics_residual_mean": 0.11819215714931489,
+      "physics_residual_std": 0.10353595389981818,
+      "forecast_error_mean": 0.24847833216190338,
+      "forecast_error_std": 0.0341537627864976
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "fno",
+      "noise_sigma": 0.05,
+      "data_mse_mean": 0.03266310729086399,
+      "data_mse_std": 0.011584498237070853,
+      "physics_residual_mean": 6.8806337547302245,
+      "physics_residual_std": 1.8956500660978144,
+      "forecast_error_mean": 0.032657739520072934,
+      "forecast_error_std": 0.011538516466518257
     },
     {
       "problem": "allen_cahn",
       "model": "tapinn",
       "noise_sigma": 0.1,
-      "data_mse_mean": 0.1231338381767273,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 1.049952745437622,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.1230197548866272,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.24766635596752168,
+      "data_mse_std": 0.03399397055384049,
+      "physics_residual_mean": 0.11840471163392068,
+      "physics_residual_std": 0.10050295532192478,
+      "forecast_error_mean": 0.2481524258852005,
+      "forecast_error_std": 0.03407846229988519
     },
     {
       "problem": "allen_cahn",
       "model": "fno",
       "noise_sigma": 0.1,
-      "data_mse_mean": 0.32909122109413147,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.010593182407319546,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.32971009612083435,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.03237089812755585,
+      "data_mse_std": 0.00908040592390892,
+      "physics_residual_mean": 7.269209003448486,
+      "physics_residual_std": 3.2318195452026397,
+      "forecast_error_mean": 0.03237082734704018,
+      "forecast_error_std": 0.00906497573400622
     },
     {
       "problem": "allen_cahn",
       "model": "tapinn",
       "noise_sigma": 0.25,
-      "data_mse_mean": 0.12156043201684952,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 1.0555254220962524,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.12145920097827911,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.24709828197956085,
+      "data_mse_std": 0.03409643969036431,
+      "physics_residual_mean": 0.11962058633565903,
+      "physics_residual_std": 0.09978389271283268,
+      "forecast_error_mean": 0.24758374094963073,
+      "forecast_error_std": 0.03418103488320827
     },
     {
       "problem": "allen_cahn",
       "model": "fno",
       "noise_sigma": 0.25,
-      "data_mse_mean": 0.32915636897087097,
-      "data_mse_std": 0.0,
-      "physics_residual_mean": 0.010526575148105621,
-      "physics_residual_std": 0.0,
-      "forecast_error_mean": 0.32977500557899475,
-      "forecast_error_std": 0.0
+      "data_mse_mean": 0.03357346281409264,
+      "data_mse_std": 0.011378136798443877,
+      "physics_residual_mean": 8.504853229522706,
+      "physics_residual_std": 3.3695774385992125,
+      "forecast_error_mean": 0.033600179478526115,
+      "forecast_error_std": 0.011389760540178664
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "tapinn",
+      "noise_sigma": 0.5,
+      "data_mse_mean": 0.24684865772724152,
+      "data_mse_std": 0.03406442370101158,
+      "physics_residual_mean": 0.1201181934773922,
+      "physics_residual_std": 0.09962105269552021,
+      "forecast_error_mean": 0.24733523428440093,
+      "forecast_error_std": 0.034148353700954
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "fno",
+      "noise_sigma": 0.5,
+      "data_mse_mean": 0.04422889053821564,
+      "data_mse_std": 0.01417461371186881,
+      "physics_residual_mean": 11.740755691528319,
+      "physics_residual_std": 3.4406930583413766,
+      "forecast_error_mean": 0.04411690756678581,
+      "forecast_error_std": 0.01415547304101464
     }
   ],
   "window_sweep": [
     {
       "problem": "duffing",
       "model": "tapinn",
+      "window_fraction": 0.05,
+      "observed_steps": 8,
+      "forecast_error_mean": 0.21188126504421234,
+      "forecast_error_std": 0.020761187746657885
+    },
+    {
+      "problem": "duffing",
+      "model": "fno",
+      "window_fraction": 0.05,
+      "observed_steps": 8,
+      "forecast_error_mean": 0.12385769337415695,
+      "forecast_error_std": 0.016352137555577368
+    },
+    {
+      "problem": "duffing",
+      "model": "tapinn",
       "window_fraction": 0.1,
       "observed_steps": 16,
-      "forecast_error_mean": 0.4472343623638153,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.2135697692632675,
+      "forecast_error_std": 0.01957739191904465
     },
     {
       "problem": "duffing",
       "model": "fno",
       "window_fraction": 0.1,
       "observed_steps": 16,
-      "forecast_error_mean": 0.42718306183815,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.1334843412041664,
+      "forecast_error_std": 0.036607119391416185
     },
     {
       "problem": "duffing",
       "model": "tapinn",
       "window_fraction": 0.2,
       "observed_steps": 32,
-      "forecast_error_mean": 0.2919492721557617,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.20580680966377257,
+      "forecast_error_std": 0.02339636490212407
     },
     {
       "problem": "duffing",
       "model": "fno",
       "window_fraction": 0.2,
       "observed_steps": 32,
-      "forecast_error_mean": 0.36817967891693115,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.13432953059673308,
+      "forecast_error_std": 0.024847426722323904
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "tapinn",
+      "window_fraction": 0.05,
+      "observed_steps": 2,
+      "forecast_error_mean": 0.26088539361953733,
+      "forecast_error_std": 0.025078688788060906
+    },
+    {
+      "problem": "allen_cahn",
+      "model": "fno",
+      "window_fraction": 0.05,
+      "observed_steps": 2,
+      "forecast_error_mean": 0.03809913732111454,
+      "forecast_error_std": 0.015312718881461644
     },
     {
       "problem": "allen_cahn",
       "model": "tapinn",
       "window_fraction": 0.1,
       "observed_steps": 3,
-      "forecast_error_mean": 0.1193687692284584,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.2562533438205719,
+      "forecast_error_std": 0.029162625834819725
     },
     {
       "problem": "allen_cahn",
       "model": "fno",
       "window_fraction": 0.1,
       "observed_steps": 3,
-      "forecast_error_mean": 0.32819658517837524,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.031904013082385066,
+      "forecast_error_std": 0.007454991418635351
     },
     {
       "problem": "allen_cahn",
       "model": "tapinn",
       "window_fraction": 0.2,
       "observed_steps": 7,
-      "forecast_error_mean": 0.2836584150791168,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.25473837554454803,
+      "forecast_error_std": 0.01080182512914844
     },
     {
       "problem": "allen_cahn",
       "model": "fno",
       "window_fraction": 0.2,
       "observed_steps": 7,
-      "forecast_error_mean": 0.3283984959125519,
-      "forecast_error_std": 0.0
+      "forecast_error_mean": 0.03539067320525646,
+      "forecast_error_std": 0.010784296216540378
     }
   ]
 }
