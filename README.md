@@ -28,6 +28,18 @@ pip install -r requirements.txt
 
 ---
 
+## Core Architectural Improvements (2026 Remediation)
+
+To address numerical instability, vanishing gradients, and phase-space misalignment in chaotic systems, the current suite implements several critical architectural fixes:
+
+- **Coordinate & State Normalization**: All inputs and targets are mapped to $[-1, 1]$. This prevents `Tanh` activation saturation in large spatiotemporal domains, which was previously causing "phase-shifting" and optimization failure.
+- **Physical Chain-Rule Scaling**: Physics residuals are computed by denormalizing model outputs to evaluate nonlinear terms (e.g., $u^3$ in Duffing), then correctly scaling derivatives using the normalizer's chain-rule constant.
+- **Warm-start Soft Alternating Optimization (Soft-AO)**: Replaces hard-frozen optimizer switches. Soft-AO preserves Adam momentum states while alternating gradient focus, preventing the optimization "shocks" that previously destabilized training.
+- **EMA-based Loss Ratio Adaptation (LRA)**: Dynamically balances data and physics loss weights based on rolling gradient norm ratios, ensuring the optimizer never collapses into pure data-fitting or pure physics-regularization.
+
+---
+
+
 ## What This Repository Implements
 
 ### Shared experiment core
@@ -256,7 +268,11 @@ The current codebase incorporates several key fixes that were missing in weaker 
 - Experiments 2, 3, and 5 include seeded summaries.
 - `exp_3` now avoids the earlier one-to-many baseline mismatch by using fairer task construction and explicit comparison groups.
 - `exp_5` now uses a better-posed standard PINN comparison protocol.
-- **Exp 1 redesign (current):** All 5 baselines added; dataset sizes tripled; 3-way train/val/test splits; EarlyStopping and ReduceLROnPlateau applied identically to all models; 150 max epochs; new multi-model comparison figures and tables. `TrainResult` now carries `epochs_trained` and `best_val_loss`.
+- **Exp 1 redesign (current):** All 5 baselines added; dataset sizes tripled; 3-way train/val/test splits; EarlyStopping and ReduceLROnPlateau standardized.
+- **Normalization & Scaling (NEW):** Universal $[-1, 1]$ normalization with chain-rule derivative scaling.
+- **Soft Alternating Optimization (NEW):** Stabilized training with momentum-preserving alternating gradient updates.
+- **Dynamic Physics Weighting (NEW):** Automatic LRA balancing between data and physics residuals.
+
 
 ### Full experiment outputs
 

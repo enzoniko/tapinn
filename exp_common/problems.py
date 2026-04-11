@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
 from scipy.integrate import solve_ivp
+
+if TYPE_CHECKING:
+    from .trainers import StateNormalizer
 
 
 @dataclass
@@ -409,33 +412,95 @@ def compute_ode_residual(
     y_pred: torch.Tensor,
     param: torch.Tensor,
     metadata: dict[str, torch.Tensor] | None = None,
+    coord_scale: float = 1.0,
+    state_normalizer: "StateNormalizer | None" = None,
 ) -> torch.Tensor:
+    """Compute the ODE physics residual in normalised space.
+
+    When coordinates are normalised (``[-1, 1]``), ``torch.autograd.grad``
+    returns ``dy/dt_norm``.  Multiplying by ``coord_scale = 2/(t_max-t_min)``
+    recovers ``dy/dt_raw``.
+
+    When outputs are normalised, ``y_pred`` is in ``[-1, 1]``.  We
+    denormalise it before evaluating the physical RHS, then renormalise the
+    result for a consistent residual magnitude during training.
+    """
     if coords.dim() == 1:
         coords = coords.unsqueeze(1)
     t = coords[:, 0]
+
+    # Compute dy_norm/dt_norm via autograd (shape: (N, state_dim))
     derivatives = []
     for dim in range(y_pred.shape[1]):
         derivatives.append(_gradient(y_pred[:, dim], coords)[:, 0])
-    dy_dt = torch.stack(derivatives, dim=1)
-    rhs = ode_rhs_torch(problem_name, t, y_pred, param, metadata=metadata)
-    return dy_dt - rhs
+    dy_dt_norm = torch.stack(derivatives, dim=1)
+
+    # Apply chain rule: dy_raw/dt_raw = (dy_norm/dt_norm) * coord_scale
+    # coord_scale = 2 / (t_max - t_min)  =>  conveys dt_raw per dt_norm
+    dy_dt_raw = dy_dt_norm * coord_scale
+
+    # Denormalise predictions for RHS evaluation
+    if state_normalizer is not None:
+        y_raw = state_normalizer.denormalize(y_pred)
+    else:
+        y_raw = y_pred
+
+    rhs_raw = ode_rhs_torch(problem_name, t, y_raw, param, metadata=metadata)
+
+    # Re-normalise RHS to the same space as dy_dt_raw for a dimensionally
+    # consistent residual.  Scale = (y_max - y_min) / 2 per dim.
+    if state_normalizer is not None:
+        state_scale = (state_normalizer.state_maxs - state_normalizer.state_mins).clamp(min=1e-6) / 2.0
+        state_scale = state_scale.to(rhs_raw.device)
+        rhs_norm = rhs_raw / state_scale   # rhs_raw has units [y_raw / t_raw]; scale to norm
+        # residual = dy_dt_raw - rhs_norm, both in [normalised_y / raw_t]
+        return dy_dt_raw - rhs_norm
+    return dy_dt_raw - rhs_raw
 
 
-def compute_pde_residual(problem_name: str, coords: torch.Tensor, u_pred: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+def compute_pde_residual(
+    problem_name: str,
+    coords: torch.Tensor,
+    u_pred: torch.Tensor,
+    param: torch.Tensor,
+    coord_scales: torch.Tensor | None = None,
+    state_normalizer: "StateNormalizer | None" = None,
+) -> torch.Tensor:
+    """Compute the PDE physics residual in normalised (t, x) coordinate space.
+
+    ``coord_scales`` is a 1-D tensor ``[2/(t_max-t_min), 2/(x_max-x_min)]``
+    from the ``CoordNormalizer``.  Autograd returns derivatives w.r.t. the
+    normalised coords; multiplying by the corresponding scale converts them
+    back to raw-coordinate derivatives.
+    """
+    # Scales default to 1.0 (no normalisation correction) if not provided
+    scale_t = float(coord_scales[0].item()) if coord_scales is not None and coord_scales.numel() >= 1 else 1.0
+    scale_x = float(coord_scales[1].item()) if coord_scales is not None and coord_scales.numel() >= 2 else 1.0
+
+    # Denormalise u_pred for nonlinear terms
+    if state_normalizer is not None:
+        # u_pred has shape (N,); denorm needs (N, 1)
+        u_raw = state_normalizer.denormalize(u_pred.unsqueeze(-1)).squeeze(-1)
+    else:
+        u_raw = u_pred
+
     grads = _gradient(u_pred, coords)
-    u_t = grads[:, 0]
-    u_x = grads[:, 1]
-    u_xx = _gradient(u_x, coords)[:, 1]
+    u_t_norm = grads[:, 0] * scale_t   # du/dt_raw
+    u_x_norm = grads[:, 1] * scale_x   # du/dx_raw
+    u_xx_raw = _gradient(u_x_norm, coords)[:, 1] * scale_x   # d2u/dx2_raw
 
+    # Re-scale output (u_pred is norm; u_t_norm is in norm/t_raw so consistent)
+    # For the nonlinear terms we use denormalised u_raw so physical constants match
     if problem_name == "allen_cahn":
         epsilon = 0.08
-        return u_t - (epsilon**2 * u_xx + param * (u_pred - u_pred**3))
+        return u_t_norm - (epsilon**2 * u_xx_raw + param * (u_raw - u_raw**3))
 
     if problem_name == "burgers":
-        return u_t + u_pred * u_x - param * u_xx
+        return u_t_norm + u_raw * u_x_norm - param * u_xx_raw
 
     if problem_name == "kuramoto_sivashinsky":
-        u_xxxx = _gradient(_gradient(u_xx, coords)[:, 1], coords)[:, 1]
-        return u_t + u_pred * u_x + u_xx + param * u_xxxx
+        u_xxx_raw = _gradient(u_xx_raw, coords)[:, 1] * scale_x
+        u_xxxx_raw = _gradient(u_xxx_raw, coords)[:, 1] * scale_x
+        return u_t_norm + u_raw * u_x_norm + u_xx_raw + param * u_xxxx_raw
 
     raise ValueError(f"Unsupported PDE problem: {problem_name}")

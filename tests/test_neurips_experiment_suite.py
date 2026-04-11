@@ -106,7 +106,7 @@ class ExperimentSuiteTest(unittest.TestCase):
         device = torch.device("cpu")
         # Tiny dataset: 6 trajectories of a Duffing oscillator
         data = generate_duffing_dataset([0.3, 0.5], num_trajectories=3, num_points=24, t_span=(0.0, 4.0), seed=42)
-        obs, coords, targets, params, ode_meta = prepare_ode_tensors(data, observation_steps=6)
+        obs, coords, targets, params, ode_meta, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=6)
         # 80% train, 20% val (no test split needed here)
         n_val = max(1, int(0.2 * len(params)))
         train_obs, val_obs = obs[:-n_val], obs[-n_val:]
@@ -145,11 +145,33 @@ class ExperimentSuiteTest(unittest.TestCase):
         set_global_seed(1)
         device = torch.device("cpu")
         data = generate_duffing_dataset([0.3], num_trajectories=2, num_points=16, t_span=(0.0, 2.0), seed=1)
-        obs, coords, targets, params, _ = prepare_ode_tensors(data, observation_steps=4)
+        obs, coords, targets, params, _, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=4)
         model = build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=False)
         result = train_tapinn(model, "duffing", obs, coords, targets, params,
                               device=device, epochs=3, batch_size=2)
         self.assertEqual(result.epochs_trained, 3)
+
+    def test_coords_are_normalized_to_minus1_1(self) -> None:
+        """Coordinates returned by prepare_ode_tensors must be in [-1, 1] to prevent Tanh saturation."""
+        data = generate_duffing_dataset([0.3], num_trajectories=2, num_points=200, t_span=(0.0, 16.0), seed=7)
+        _, coords, _, _, _, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=4)
+        self.assertAlmostEqual(float(coords.min()), -1.0, places=4,
+                               msg="Min coordinate should be -1.0 after normalization")
+        self.assertAlmostEqual(float(coords.max()),  1.0, places=4,
+                               msg="Max coordinate should be +1.0 after normalization")
+
+    def test_state_normalizer_round_trips_lorenz_scale(self) -> None:
+        """StateNormalizer must exactly round-trip Lorenz-scale states (high magnitude)."""
+        from exp_common.trainers import StateNormalizer
+        y_raw = torch.randn(50, 3) * 20  # Lorenz scale O(20)
+        sn = StateNormalizer.from_targets(y_raw)
+        y_norm = sn.normalize(y_raw)
+        y_back = sn.denormalize(y_norm)
+        round_trip_err = float((y_back - y_raw).abs().max())
+        self.assertLess(round_trip_err, 1e-5, msg="StateNormalizer round-trip error too large")
+        norm_min, norm_max = float(y_norm.min()), float(y_norm.max())
+        self.assertAlmostEqual(norm_min, -1.0, places=4)
+        self.assertAlmostEqual(norm_max,  1.0, places=4)
 
     # ------------------------------------------------------------------ #
     # Physics / residual correctness                                       #
@@ -168,7 +190,7 @@ class ExperimentSuiteTest(unittest.TestCase):
 
     def test_kuramoto_metadata_is_preserved_and_used(self) -> None:
         data = generate_kuramoto_dataset([1.0], num_trajectories=1, num_points=96, t_span=(0.0, 10.0), num_oscillators=5, seed=11)
-        observations, coords, targets, params, ode_metadata = prepare_ode_tensors(data, observation_steps=12)
+        observations, coords, targets, params, ode_metadata, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=12)
         self.assertIsNotNone(ode_metadata)
         self.assertEqual(tuple(ode_metadata.shape), (1, 5))
         self.assertTrue(torch.allclose(ode_metadata[0], torch.tensor(data.metadata["natural_frequencies"][0], dtype=torch.float32)))
@@ -201,7 +223,7 @@ class ExperimentSuiteTest(unittest.TestCase):
     def test_param_only_baselines_reject_duplicate_parameter_tasks(self) -> None:
         """_eval_model_on_dataset (Exp 3) still rejects HyperPINN with duplicate params."""
         data = generate_duffing_dataset([0.3], num_trajectories=3, num_points=24, t_span=(0.0, 4.0), seed=5)
-        observations, coords, targets, params, ode_metadata = prepare_ode_tensors(data, observation_steps=6)
+        observations, coords, targets, params, ode_metadata, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=6)
         with self.assertRaises(ValueError):
             _eval_model_on_dataset(
                 "hyperpinn",
@@ -220,11 +242,16 @@ class ExperimentSuiteTest(unittest.TestCase):
 
     def test_prepare_pde_tensors_preserve_dataset_grid(self) -> None:
         data = generate_allen_cahn_dataset([0.9], num_samples=1, nx=20, nt=12, seed=3)
-        _, coords, _, _ = prepare_pde_tensors(data, observation_steps=4)
+        _, coords, _, _, coord_norm, state_norm = prepare_pde_tensors(data, observation_steps=4)
         coord_sample = coords[0].cpu().numpy()
+        # With normalization, both dims should have exactly nt and nx distinct values
         self.assertEqual(len(set(coord_sample[:, 0].tolist())), len(data.times))
         self.assertEqual(len(set(coord_sample[:, 1].tolist())), len(data.space))
-        self.assertAlmostEqual(float(coord_sample[:, 1].max()), float(data.space.max()), places=5)
+        # Normalized to [-1, 1]
+        self.assertAlmostEqual(float(coord_sample[:, 0].max()),  1.0, places=4)
+        self.assertAlmostEqual(float(coord_sample[:, 0].min()), -1.0, places=4)
+        self.assertAlmostEqual(float(coord_sample[:, 1].max()),  1.0, places=4)
+        self.assertAlmostEqual(float(coord_sample[:, 1].min()), -1.0, places=4)
 
     # ------------------------------------------------------------------ #
     # Smoke-run all scripts                                                #

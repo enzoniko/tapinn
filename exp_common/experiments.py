@@ -33,12 +33,15 @@ from .problems import (
 from .repro import set_global_seed
 from .trainers import (
     CallbackConfig,
+    CoordNormalizer,
+    StateNormalizer,
     ValBundle,
     predict_direct,
     predict_fno,
     predict_tapinn,
     prepare_ode_tensors,
     prepare_pde_tensors,
+    refit_normalizers_on_split,
     train_direct_model,
     train_fno_model,
     train_tapinn,
@@ -231,74 +234,121 @@ def _bar_plot(labels: list[str], values: list[float], title: str, path: Path) ->
 
 
 def _spectrum_plot(records: list[dict[str, object]], title: str, path: Path, problem_name: str | None = None) -> None:
-    fig, ax = plt.subplots(figsize=(6.0, 4.0))
-    # If problem_name is provided, only plot records for that problem
+    """NTK spectrum plot — one averaged line per model, always with legend."""
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
     plot_records = records if problem_name is None else [r for r in records if r.get("problem") == problem_name]
-    
+
+    # Aggregate: for each (model, epoch), average eigenvalues across seeds
+    from collections import defaultdict
+    model_epoch_eigs: dict[str, list[np.ndarray]] = defaultdict(list)
     for record in plot_records:
-        eigvals = np.asarray(record["eigenvalues"], dtype=np.float64)
-        ranks = np.arange(1, len(eigvals) + 1)
-        label = f'{record["model"]} @ {record["epoch"]}'
-        if problem_name is None and "problem" in record:
-            label = f'{record["problem"]} - {label}'
-        ax.plot(ranks, eigvals, marker="o", linewidth=1.6, label=label)
-    
+        key = str(record["model"])
+        model_epoch_eigs[key].append(np.asarray(record["eigenvalues"], dtype=np.float64))
+
+    # Determine a stable colour cycle
+    prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    markers = ["o", "s", "^", "D", "v", "P"]
+    for idx, (model_name, eig_list) in enumerate(sorted(model_epoch_eigs.items())):
+        # Pad to same length then take median across seed/epoch records
+        max_len = max(len(e) for e in eig_list)
+        stacked = np.array([np.pad(e, (0, max_len - len(e)), constant_values=np.nan) for e in eig_list])
+        median_eigs = np.nanmedian(stacked, axis=0)
+        ranks = np.arange(1, len(median_eigs) + 1)
+        col = prop_cycle[idx % len(prop_cycle)]
+        mk = markers[idx % len(markers)]
+        ax.plot(ranks, median_eigs, marker=mk, linewidth=1.6, color=col,
+                label=model_name, markevery=max(1, len(ranks)//8))
+
     ax.set_xlabel("Eigenvalue Rank")
-    ax.set_ylabel("NTK Eigenvalue")
+    ax.set_ylabel("NTK Eigenvalue (median)")
     ax.set_yscale("log")
     ax.set_title(title)
-    if len(plot_records) <= 10:
-        ax.legend(loc="best", fontsize=8)
+    ax.legend(loc="best", fontsize=8, framealpha=0.7)
     save_figure(fig, path)
 
 
 def _condition_plot(records: list[dict[str, object]], title: str, path: Path, problem_name: str | None = None) -> None:
-    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    """Jacobian condition number plot — mean ± std shaded band, one per model."""
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
     plot_records = records if problem_name is None else [r for r in records if r.get("problem") == problem_name]
-    
-    models = sorted({record["model"] for record in plot_records})
-    for model_name in models:
-        subset = [record for record in plot_records if record["model"] == model_name]
-        ax.plot([item["epoch"] for item in subset], [item["condition_number"] for item in subset], marker="o", label=model_name)
-    
+
+    from collections import defaultdict
+    prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    markers = ["o", "s", "^", "D", "v", "P"]
+
+    # Group by model then epoch: collect condition numbers across seeds
+    model_epoch_data: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for r in plot_records:
+        model_epoch_data[str(r["model"])][int(r["epoch"])].append(float(r["condition_number"]))
+
+    for idx, model_name in enumerate(sorted(model_epoch_data.keys())):
+        epoch_data = model_epoch_data[model_name]
+        epochs_sorted = sorted(epoch_data.keys())
+        means = np.array([np.mean(epoch_data[e]) for e in epochs_sorted])
+        stds  = np.array([np.std(epoch_data[e])  for e in epochs_sorted])
+        col = prop_cycle[idx % len(prop_cycle)]
+        mk  = markers[idx % len(markers)]
+        ax.plot(epochs_sorted, means, marker=mk, linewidth=1.8, color=col,
+                label=model_name, markevery=max(1, len(epochs_sorted)//6))
+        ax.fill_between(epochs_sorted,
+                        np.maximum(means - stds, 1e-12),
+                        means + stds,
+                        color=col, alpha=0.18)
+
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Jacobian Condition Number")
+    ax.set_ylabel("Jacobian Condition Number (mean ± std)")
     ax.set_yscale("log")
     ax.set_title(title)
-    ax.legend(loc="best")
+    ax.legend(loc="best", fontsize=8, framealpha=0.7)
     save_figure(fig, path)
 
 
 def _final_conditioning_summary_plot(records: list[dict[str, object]], path: Path) -> None:
-    """Summary plot: Problem vs Mean Final Condition Number (log scale)."""
-    fig, ax = plt.subplots(figsize=(8.0, 5.0))
-    
+    """Summary bar plot: Problem vs Mean Final Condition Number (log scale)."""
     problems = sorted({r["problem"] for r in records if "problem" in r})
     if not problems:
         return
-        
+
     models = sorted({r["model"] for r in records})
     max_epoch = max(r["epoch"] for r in records)
-    
-    x = np.arange(len(problems))
-    width = 0.25
-    
+
+    n_models = len(models)
+    n_problems = len(problems)
+    bar_w = 0.7 / max(n_models, 1)
+    # Add a visible gap between problem groups
+    group_spacing = n_models * bar_w + 0.4
+    group_centers = np.arange(n_problems) * group_spacing
+
+    fig_w = max(8.0, group_spacing * n_problems + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.0))
+
+    prop_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     for i, model_name in enumerate(models):
         final_conds = []
         for prob in problems:
-            # Average across seeds if multiple records exist for (prob, model, max_epoch)
-            subset = [r["condition_number"] for r in records 
-                     if r["problem"] == prob and r["model"] == model_name and r["epoch"] == max_epoch]
-            final_conds.append(np.mean(subset) if subset else 1.0)
-        
-        ax.bar(x + i * width - (len(models)-1)*width/2, final_conds, width, label=model_name)
-        
-    ax.set_ylabel("Final Condition Number (Mean)")
+            subset = [
+                r["condition_number"] for r in records
+                if r["problem"] == prob and r["model"] == model_name and r["epoch"] == max_epoch
+            ]
+            final_conds.append(float(np.mean(subset)) if subset else 1.0)
+
+        offsets = group_centers + (i - (n_models - 1) / 2.0) * bar_w
+        bars = ax.bar(offsets, final_conds, bar_w * 0.9,
+                      label=model_name, color=prop_cycle[i % len(prop_cycle)])
+        # Annotate bar tops
+        for bar, val in zip(bars, final_conds):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.05,
+                f"{val:.1e}", ha="center", va="bottom", fontsize=6, rotation=45,
+            )
+
+    ax.set_ylabel("Final Condition Number (mean)")
     ax.set_yscale("log")
     ax.set_title("Optimization Stability Across Case Studies")
-    ax.set_xticks(x)
-    ax.set_xticklabels(problems, rotation=25)
-    ax.legend()
+    ax.set_xticks(group_centers)
+    ax.set_xticklabels(problems, rotation=25, ha="right", fontsize=9)
+    ax.legend(loc="upper left", fontsize=8, framealpha=0.8)
+    fig.tight_layout()
     save_figure(fig, path)
 
 
@@ -369,6 +419,8 @@ def _train_ode_model(
     max_epochs: int,
     batch_size: int,
     seed: int,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
 ):
     """Train a single model, applying identical callbacks for fairness."""
     desc = f"{model_name[:8]}-{problem_name[:6]}-s{seed}"
@@ -388,6 +440,8 @@ def _train_ode_model(
             progress_desc=desc,
             val_bundle=val_bundle,
             callbacks=callbacks,
+            coord_normalizer=coord_normalizer,
+            state_normalizer=state_normalizer,
         )
     elif family == "fno":
         fno_val: ValBundle | None = None
@@ -425,6 +479,8 @@ def _train_ode_model(
             progress_desc=desc,
             val_bundle=val_bundle,
             callbacks=callbacks,
+            coord_normalizer=coord_normalizer,
+            state_normalizer=state_normalizer,
         )
 
 
@@ -436,12 +492,14 @@ def _predict_ode_model(
     test_params: torch.Tensor,
     num_points: int,
     device: torch.device,
+    state_normalizer: StateNormalizer | None = None,
 ) -> tuple[np.ndarray, float]:
     """Run inference for a model and return (predictions_numpy, inference_ms)."""
     family = _EXP1_MODELS[model_name][0]
     if family == "tapinn":
         return _measure_inference_ms(
-            _tapinn_predict_numpy, test_obs.shape[0],
+            lambda *a: predict_tapinn(*a, state_normalizer=state_normalizer).detach().cpu().numpy(),
+            test_obs.shape[0],
             model, test_obs, test_coords, device,
         )
     elif family == "fno":
@@ -451,7 +509,8 @@ def _predict_ode_model(
         )
     else:
         return _measure_inference_ms(
-            _direct_predict_numpy, test_obs.shape[0],
+            lambda *a: predict_direct(*a, state_normalizer=state_normalizer).detach().cpu().numpy(),
+            test_obs.shape[0],
             model, family, test_obs, test_coords, test_params, device,
         )
 
@@ -517,7 +576,7 @@ def _run_ode_seed_all_models(
         raise ValueError(problem_name)
 
     obs_steps = 8 if smoke_test else max(24, int(0.15 * data.states.shape[1]))
-    observations, coords, targets, params, ode_metadata = prepare_ode_tensors(data, observation_steps=obs_steps)
+    observations, coords, targets, params, ode_metadata, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=obs_steps)
 
     # ------------------------------------------------------------------
     # 2. Three-way split (70 / 15 / 15)
@@ -530,6 +589,13 @@ def _run_ode_seed_all_models(
     val_ode_meta   = _subset_optional_tensor(val_idx,   ode_metadata)
     test_ode_meta  = _subset_optional_tensor(test_idx,  ode_metadata)
 
+    # Refit normalizers on training split only (no data leakage)
+    coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
+    # Re-apply normalisation on all splits using training-fit normalizers
+    train_targets = state_norm.normalize(state_norm.denormalize(train_targets))  # no-op after refit
+    val_targets   = state_norm.normalize(state_norm.denormalize(val_targets))
+    test_targets  = state_norm.normalize(state_norm.denormalize(test_targets))
+
     val_bundle = ValBundle(
         observations=val_obs,
         coords=val_coords,
@@ -537,8 +603,6 @@ def _run_ode_seed_all_models(
         params=val_params,
         ode_metadata=val_ode_meta,
     )
-    # Disable callbacks if validation set is empty (can happen in smoke test
-    # with very few samples).  All models receive the same treatment.
     active_val_bundle: ValBundle | None = val_bundle if val_obs.shape[0] > 0 else None
     active_callbacks: CallbackConfig | None = callbacks if val_obs.shape[0] > 0 else None
 
@@ -554,17 +618,22 @@ def _run_ode_seed_all_models(
     # 4. Train + evaluate each model
     # ------------------------------------------------------------------
     results: dict[str, dict] = {}
-    truth = test_targets.cpu().numpy()
+    # Denormalise test targets for ground-truth metric evaluation
+    truth_norm = test_targets.cpu().numpy()  # normalised, for loss checks
+    truth = state_norm.denormalize(test_targets).cpu().numpy()  # physical space
 
     for model_name, model in tqdm(models.items(), desc=f"{problem_name[:6]}/models", leave=False):
         train_result = _train_ode_model(
             model_name, model, problem_name,
             train_obs, train_coords, train_targets, train_params, train_ode_meta,
             active_val_bundle, active_callbacks, device, max_epochs, batch_size, seed,
+            coord_normalizer=coord_norm, state_normalizer=state_norm,
         )
         predictions, inference_ms = _predict_ode_model(
             model_name, model, test_obs, test_coords, test_params, num_points, device,
+            state_normalizer=state_norm,
         )
+        # predictions are now in physical (denormalised) space
         data_mse, physics_residual = _aggregate_ode_metrics(
             problem_name, data.times, predictions, truth, test_params, test_ode_meta,
         )
@@ -913,9 +982,10 @@ def _eval_robustness_grid_point(
     seed: int,
 ) -> dict:
     """Evaluate a single model at one grid point (noise/window)."""
-    (t_obs, t_coords, t_targets, t_params, t_meta) = train_tuple
-    (v_obs, v_coords, v_targets, v_params, v_meta) = val_tuple
-    (s_obs, s_coords, s_targets, s_params, s_meta) = test_tuple
+    (t_obs, t_coords, t_targets, t_params, t_meta, t_sn, t_cn) = train_tuple
+    (v_obs, v_coords, v_targets, v_params, v_meta, v_sn, v_cn) = val_tuple
+    (s_obs, s_coords, s_targets, s_params, s_meta, s_sn, s_cn) = test_tuple
+
 
     # 1. Apply observational noise (relative to training std)
     obs_std = float(t_obs.std().item()) if t_obs.numel() else 1.0
@@ -941,13 +1011,22 @@ def _eval_robustness_grid_point(
 
     # 3. Train
     family = _EXP4_MODELS[model_name][0]
+    # coords are already normalised by prepare_*_tensors; state_norm provided by caller
+    state_norm_arg = t_sn
+    coord_norm_arg = t_cn
+
     if family == "tapinn":
         train_result = train_tapinn(
             model, problem_name, noisy_t_obs, t_coords, t_targets, t_params, device,
             ode_metadata=t_meta, epochs=max_epochs, batch_size=4, progress_desc=f"{model_name}-noise{noise_sigma}",
             val_bundle=val_bundle, callbacks=callbacks,
+            coord_normalizer=coord_norm_arg, state_normalizer=state_norm_arg,
         )
-        preds, inference_ms = _measure_inference_ms(_tapinn_predict_numpy, noisy_s_obs.shape[0], model, noisy_s_obs, s_coords, device)
+        preds, inference_ms = _measure_inference_ms(
+            lambda *a: predict_tapinn(*a, state_normalizer=state_norm_arg).detach().cpu().numpy(),
+            noisy_s_obs.shape[0], model, noisy_s_obs, s_coords, device,
+        )
+
     else:
         train_result = train_fno_model(
             model, noisy_t_obs, t_targets, device, epochs=max_epochs, batch_size=4,
@@ -960,10 +1039,12 @@ def _eval_robustness_grid_point(
     test_truth = s_targets.cpu().numpy()
     if problem_name == "allen_cahn":
         # AC is fixed size in this suite: nt=36, nx=48
-        data_mse, physics = _aggregate_pde_metrics(problem_name, np.linspace(0, 1, 36), np.linspace(0, 1, 48), preds, test_truth, s_params, "periodic")
+        data_mse, physics = _aggregate_pde_metrics(problem_name, np.linspace(0, 1, 36), np.linspace(-1, 1, 48), preds, test_truth, s_params, "periodic")
     else:
-        # ODE uses grid_size as nt
-        data_mse, physics = _aggregate_ode_metrics(problem_name, np.linspace(0, 1, grid_size), preds, test_truth, s_params, s_meta)
+        # ODE: Duffing (T=16), Kuramoto (T=10). We infer or assume based on problem_name.
+        t_final = 16.0 if problem_name == "duffing" else 10.0
+        data_mse, physics = _aggregate_ode_metrics(problem_name, np.linspace(0, t_final, grid_size), preds, test_truth, s_params, s_meta)
+
 
     forecast_error = float(mse(preds[:, obs_steps:, :], test_truth[:, obs_steps:, :]))
 
@@ -1015,7 +1096,7 @@ def run_exp_4_sensitivity_and_robustness(output_root: str, device_name: str, smo
     def get_data_duffing(s):
         p = [0.24, 0.38, 0.52] if smoke_test else np.linspace(0.2, 0.55, 7).tolist()
         d = generate_duffing_dataset(p, num_trajectories=1 if smoke_test else 10, num_points=160, t_span=(0.0, 16.0), seed=s)
-        return prepare_ode_tensors(d, observation_steps=16) # Fixed 10% window for noise sweep
+        return prepare_ode_tensors(d, observation_steps=16)  # returns 7-tuple
 
     def get_data_allen(s):
         p = [0.8, 1.1] if smoke_test else [0.75, 0.9, 1.05, 1.2]
@@ -1029,17 +1110,22 @@ def run_exp_4_sensitivity_and_robustness(output_root: str, device_name: str, smo
                 seed_metrics = []
                 for local_seed in tqdm(seeds, desc=f"Seeds (noise={noise})", leave=False):
                     set_global_seed(local_seed)
-                    tensors = data_fn(local_seed) 
-                    # ODE (5 tensors) vs PDE (4 tensors)
+                    tensors = data_fn(local_seed)
                     obs, crds, trgs, prms = tensors[:4]
-                    meta = tensors[4] if len(tensors) > 4 else None
-                    
+                    meta_raw = tensors[4] if len(tensors) == 7 else None
+
                     train_idx, val_idx, test_idx = _split_indices_three_way(len(prms), local_seed)
-                    t_tup = tuple(_subset_tensors(train_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(train_idx, meta),)
-                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta),)
-                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta),)
+
+                    # 2.2 Re-fit normalizers on training split for rigor
+                    t_obs, t_crds, t_trgs, t_prms = _subset_tensors(train_idx, obs, crds, trgs, prms)
+                    c_norm, s_norm = refit_normalizers_on_split(t_obs, t_crds, t_trgs)
+
+                    t_tup = (t_obs, t_crds, t_trgs, t_prms, _subset_optional_tensor(train_idx, meta_raw), s_norm, c_norm)
+                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta_raw), s_norm, c_norm)
+                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta_raw), s_norm, c_norm)
 
                     res = _eval_robustness_grid_point(model_name, problem_name, t_tup, v_tup, s_tup, noise, device, max_epochs, callbacks, local_seed)
+
                     seed_metrics.append(res)
                 
                 # Aggregate across seeds
@@ -1074,20 +1160,24 @@ def run_exp_4_sensitivity_and_robustness(output_root: str, device_name: str, smo
                     if problem_name == "duffing":
                         p = [0.24, 0.38, 0.52] if smoke_test else np.linspace(0.2, 0.55, 7).tolist()
                         d = generate_duffing_dataset(p, num_trajectories=1 if smoke_test else 10, num_points=160, t_span=(0.0, 16.0), seed=local_seed)
-                        tensors = prepare_ode_tensors(d, observation_steps=obs_steps)
+                        obs, crds, trgs, prms, meta, _cn, _sn = prepare_ode_tensors(d, observation_steps=obs_steps)
                     else:
                         p = [0.8, 1.1] if smoke_test else [0.75, 0.9, 1.05, 1.2]
                         d = generate_allen_cahn_dataset(p, num_samples=1 if smoke_test else 8, nx=48, nt=36, seed=local_seed + 11)
-                        tensors = prepare_pde_tensors(d, observation_steps=obs_steps)
-                    
-                    obs, crds, trgs, prms = tensors[:4]
-                    meta = tensors[4] if len(tensors) > 4 else None
+                        obs, crds, trgs, prms, _cn, _sn = prepare_pde_tensors(d, observation_steps=obs_steps)
+                        meta = None
                     train_idx, val_idx, test_idx = _split_indices_three_way(len(prms), local_seed)
-                    t_tup = tuple(_subset_tensors(train_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(train_idx, meta),)
-                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta),)
-                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta),)
+                    
+                    # 3.2 Re-fit normalizers on training split
+                    t_obs, t_crds, t_trgs, t_prms = _subset_tensors(train_idx, obs, crds, trgs, prms)
+                    c_norm, s_norm = refit_normalizers_on_split(t_obs, t_crds, t_trgs)
+
+                    t_tup = (t_obs, t_crds, t_trgs, t_prms, _subset_optional_tensor(train_idx, meta), s_norm, c_norm)
+                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta), s_norm, c_norm)
+                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta), s_norm, c_norm)
 
                     res = _eval_robustness_grid_point(model_name, problem_name, t_tup, v_tup, s_tup, 0.0, device, max_epochs, callbacks, local_seed)
+
                     res["window_fraction"] = frac
                     seed_metrics.append(res)
                 
@@ -1257,23 +1347,23 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
         for local_seed in tqdm(seeds, desc=f"Seeds-{problem_name}", leave=False):
             set_global_seed(local_seed)
             
-            # 1. Data Generation
+            # 1. Data Generation — coords and targets are normalised to [-1, 1]
             if problem_name == "duffing":
                 data = generate_duffing_dataset([0.3, 0.5], 1, 160, (0.0, 10.0), local_seed)
-                obs, coords, targets, params, meta = prepare_ode_tensors(data, observation_steps=20)
+                obs, coords, targets, params, meta, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=20)
             elif problem_name == "kuramoto":
                 data = generate_kuramoto_dataset([2.0, 4.0], 1, 160, (0.0, 10.0), 16, local_seed)
-                obs, coords, targets, params, meta = prepare_ode_tensors(data, observation_steps=20)
+                obs, coords, targets, params, meta, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=20)
             elif problem_name == "lorenz":
                 data = generate_lorenz_dataset([18.0, 24.74], 1, 160, (0.0, 6.0), local_seed)
-                obs, coords, targets, params, meta = prepare_ode_tensors(data, observation_steps=20)
+                obs, coords, targets, params, meta, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=20)
             elif problem_name == "allen_cahn":
                 data = generate_allen_cahn_dataset([1.0], 1, 64, 48, local_seed)
-                obs, coords, targets, params = prepare_pde_tensors(data, observation_steps=8)
+                obs, coords, targets, params, coord_norm, state_norm = prepare_pde_tensors(data, observation_steps=8)
                 meta = None
             elif problem_name == "kuramoto_sivashinsky":
                 data = generate_kuramoto_sivashinsky_dataset([1.0], 1, 64, 48, local_seed)
-                obs, coords, targets, params = prepare_pde_tensors(data, observation_steps=8)
+                obs, coords, targets, params, coord_norm, state_norm = prepare_pde_tensors(data, observation_steps=8)
                 meta = None
             else:
                 continue
@@ -1281,6 +1371,8 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
             train_idx, _, test_idx = _split_indices_three_way(len(params), local_seed)
             train_obs, train_coords, train_targets, train_params = _subset_tensors(train_idx, obs, coords, targets, params)
             test_obs,  test_coords,  test_targets,  test_params  = _subset_tensors(test_idx,  obs, coords, targets, params)
+            # Refit normalizers on training split to prevent data leakage
+            coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
             train_meta = _subset_optional_tensor(train_idx, meta)
             test_meta  = _subset_optional_tensor(test_idx,  meta)
 
@@ -1296,26 +1388,28 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
                 model.to(device)
                 use_config = (opt_type == "config")
                 use_soap = (opt_type == "soap")
-                
-                # Landscape Captures
+
+                # Landscape Captures: checkpoint every `checkpoint_step` epochs
                 for epoch in range(0, total_epochs + 1, checkpoint_step):
                     if epoch > 0:
                         desc = f"{problem_name[:3]}-{model_name[:4]}-ep{epoch}-s{local_seed}"
                         if family == "tapinn":
                             train_tapinn(
-                                model, problem_name, train_obs, train_coords, train_targets, train_params, 
+                                model, problem_name, train_obs, train_coords, train_targets, train_params,
                                 device, ode_metadata=train_meta, epochs=checkpoint_step, batch_size=4,
                                 alternating=bool(alternating), progress_desc=desc, val_bundle=None, callbacks=callbacks,
                                 use_config=use_config, use_soap=use_soap,
+                                coord_normalizer=coord_norm, state_normalizer=state_norm,
                             )
                         else:
                             train_direct_model(
-                                model, problem_name, "standard", train_obs, train_coords, train_targets, train_params, 
+                                model, problem_name, "standard", train_obs, train_coords, train_targets, train_params,
                                 device, ode_metadata=train_meta, epochs=checkpoint_step, batch_size=4,
                                 progress_desc=desc, val_bundle=None, callbacks=callbacks,
                                 use_config=use_config, use_soap=use_soap,
+                                coord_normalizer=coord_norm, state_normalizer=state_norm,
                             )
-                    
+
                     eigvals, condition_number, lipschitz = _finite_ntk_and_condition(
                         model, "tapinn" if family == "tapinn" else "direct",
                         train_obs, train_coords, train_params, device
@@ -1323,18 +1417,20 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
                     spectrum_records.append({"problem": problem_name, "model": model_name, "epoch": epoch, "eigenvalues": eigvals[:24]})
                     condition_records.append({"problem": problem_name, "model": model_name, "epoch": epoch, "condition_number": condition_number, "lipschitz": lipschitz})
 
-                # Final Accuracy Stats
+                # Final Accuracy Stats — denormalise predictions for evaluation
                 if family == "tapinn":
-                    preds = _tapinn_predict_numpy(model, test_obs, test_coords, device)
+                    preds = predict_tapinn(model, test_obs, test_coords, device, state_normalizer=state_norm).cpu().numpy()
                 else:
-                    preds = _direct_predict_numpy(model, "standard", test_obs, test_coords, test_params, device)
-                
+                    preds = predict_direct(model, "standard", test_obs, test_coords, test_params, device, state_normalizer=state_norm).cpu().numpy()
+
+                # Ground truth in physical (denormalised) space
+                truth_phys = state_norm.denormalize(test_targets).cpu().numpy()
                 if problem_name in ["duffing", "kuramoto", "lorenz"]:
-                    d_mse, p_res = _aggregate_ode_metrics(problem_name, data.times, preds, test_targets.cpu().numpy(), test_params, test_meta)
+                    d_mse, p_res = _aggregate_ode_metrics(problem_name, data.times, preds, truth_phys, test_params, test_meta)
                 else:
                     boundary = str(data.metadata.get("boundary", "periodic")) if data.metadata else "periodic"
-                    d_mse, p_res = _aggregate_pde_metrics(problem_name, data.times, data.space, preds, test_targets.cpu().numpy(), test_params, boundary)
-                
+                    d_mse, p_res = _aggregate_pde_metrics(problem_name, data.times, data.space, preds, truth_phys, test_params, boundary)
+
                 seed_rows.append({"problem": problem_name, "seed": local_seed, "model": model_name, "data_mse": d_mse, "physics_residual": p_res})
 
         # Per-problem plots
@@ -1403,6 +1499,9 @@ def _train_pde_model(
     max_epochs: int,
     batch_size: int,
     seed: int,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
+    max_phys_points: int = 64,
 ):
     """Train a single PDE model, applying identical callbacks for fairness."""
     desc = f"{model_name[:8]}-{problem_name[:8]}-s{seed}"
@@ -1422,6 +1521,9 @@ def _train_pde_model(
             progress_desc=desc,
             val_bundle=val_bundle,
             callbacks=callbacks,
+            coord_normalizer=coord_normalizer,
+            state_normalizer=state_normalizer,
+            max_phys_points=max_phys_points,
         )
     elif family == "fno":
         fno_val: ValBundle | None = None
@@ -1459,7 +1561,11 @@ def _train_pde_model(
             progress_desc=desc,
             val_bundle=val_bundle,
             callbacks=callbacks,
+            coord_normalizer=coord_normalizer,
+            state_normalizer=state_normalizer,
+            max_phys_points=max_phys_points,
         )
+
 
 
 def _predict_pde_model(
@@ -1470,12 +1576,14 @@ def _predict_pde_model(
     test_params: torch.Tensor,
     grid_size: int,
     device: torch.device,
+    state_normalizer: StateNormalizer | None = None,
 ) -> tuple[np.ndarray, float]:
     """Run inference for a PDE model; return (predictions_numpy, inference_ms)."""
     family = _EXP2_MODELS[model_name][0]
     if family == "tapinn":
         return _measure_inference_ms(
-            _tapinn_predict_numpy, test_obs.shape[0],
+            lambda *a: predict_tapinn(*a, state_normalizer=state_normalizer).detach().cpu().numpy(),
+            test_obs.shape[0],
             model, test_obs, test_coords, device,
         )
     elif family == "fno":
@@ -1485,7 +1593,8 @@ def _predict_pde_model(
         )
     else:
         return _measure_inference_ms(
-            _direct_predict_numpy, test_obs.shape[0],
+            lambda *a: predict_direct(*a, state_normalizer=state_normalizer).detach().cpu().numpy(),
+            test_obs.shape[0],
             model, family, test_obs, test_coords, test_params, device,
         )
 
@@ -1520,8 +1629,12 @@ def _run_pde_seed_all_models(
     # 1. Generate data
     # ------------------------------------------------------------------
     num_samples_per_param = 1 if smoke_test else 6
-    nx = 20 if smoke_test else 64
-    nt = 14 if smoke_test else 48
+    # KS is 4th-order PDE: autograd is O(N^4), so keep grid tiny in smoke mode
+    if smoke_test and problem_name == "kuramoto_sivashinsky":
+        nx, nt = 8, 6   # 48 physics points — manageable even on CPU
+    else:
+        nx = 20 if smoke_test else 64
+        nt = 14 if smoke_test else 48
 
     if problem_name == "allen_cahn":
         data = generate_allen_cahn_dataset(param_values, num_samples=num_samples_per_param, nx=nx, nt=nt, seed=seed)
@@ -1532,8 +1645,9 @@ def _run_pde_seed_all_models(
     else:
         raise ValueError(problem_name)
 
-    obs_steps = 4 if smoke_test else 8
-    observations, coords, targets, params = prepare_pde_tensors(data, observation_steps=obs_steps)
+    obs_steps = 2 if (smoke_test and problem_name == "kuramoto_sivashinsky") else (4 if smoke_test else 8)
+
+    observations, coords, targets, params, coord_norm, state_norm = prepare_pde_tensors(data, observation_steps=obs_steps)
 
     # ------------------------------------------------------------------
     # 2. Three-way split (70 / 15 / 15)
@@ -1542,6 +1656,9 @@ def _run_pde_seed_all_models(
     train_obs, train_coords, train_targets, train_params = _subset_tensors(train_idx, observations, coords, targets, params)
     val_obs,   val_coords,   val_targets,   val_params   = _subset_tensors(val_idx,   observations, coords, targets, params)
     test_obs,  test_coords,  test_targets,  test_params  = _subset_tensors(test_idx,  observations, coords, targets, params)
+
+    # Refit normalizers on training split only (no data leakage)
+    coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
 
     val_bundle = ValBundle(
         observations=val_obs,
@@ -1566,22 +1683,28 @@ def _run_pde_seed_all_models(
     # 4. Train + evaluate each model
     # ------------------------------------------------------------------
     results: dict[str, dict] = {}
-    truth = test_targets.cpu().numpy()
+    truth = state_norm.denormalize(test_targets).cpu().numpy()  # physical space
 
     for model_name, model in tqdm(models.items(), desc=f"{problem_name[:8]}/models", leave=False):
+        # KS with 4th-order autograd is expensive: cap physics batch size in smoke mode
+        ks_smoke = smoke_test and problem_name == "kuramoto_sivashinsky"
         train_result = _train_pde_model(
             model_name, model, problem_name,
             train_obs, train_coords, train_targets, train_params,
             active_val_bundle, active_callbacks, device, max_epochs, batch_size, seed,
+            coord_normalizer=coord_norm, state_normalizer=state_norm,
+            max_phys_points=8 if ks_smoke else 64,
         )
         predictions, inference_ms = _predict_pde_model(
             model_name, model, test_obs, test_coords, test_params, grid_size, device,
+            state_normalizer=state_norm,
         )
+        # predictions are denormalised (physical space)
         data_mse, physics_residual = _aggregate_pde_metrics(
             problem_name, data.times, data.space, predictions, truth, test_params, boundary,
         )
         _, comparison_group = _EXP2_MODELS[model_name]
-        # Heatmap data from first test sample
+        # Heatmap data from first test sample (physical space)
         pred_field = predictions[0, :, 0].reshape(actual_nt, actual_nx)
         truth_field = truth[0, :, 0].reshape(actual_nt, actual_nx)
         results[model_name] = {
@@ -2021,12 +2144,12 @@ def run_exp_3_sota_baselines_and_capacity(output_root: str, device_name: str, sm
             # Duffing: Increase task consistency with 10 trajectories instead of 1
             duff_params = [0.24, 0.38, 0.52] if smoke_test else np.linspace(0.2, 0.55, 7).tolist()
             duff_data = generate_duffing_dataset(duff_params, num_trajectories=1 if smoke_test else 10, num_points=56 if smoke_test else 160, t_span=(0.0, 16.0), seed=local_seed)
-            duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta = prepare_ode_tensors(duff_data, observation_steps=8 if smoke_test else 20)
+            duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, _dcn, _dsn = prepare_ode_tensors(duff_data, observation_steps=8 if smoke_test else 20)
 
             # Allen-Cahn: Increase samples from 1 to 8 instead of 1
             allen_params = [0.8, 1.1] if smoke_test else [0.75, 0.9, 1.05, 1.2]
             allen_data = generate_allen_cahn_dataset(allen_params, num_samples=1 if smoke_test else 8, nx=16 if smoke_test else 48, nt=16 if smoke_test else 36, seed=local_seed + 11)
-            allen_obs, allen_coords, allen_targets, allen_params_t = prepare_pde_tensors(allen_data, observation_steps=4 if smoke_test else 8)
+            allen_obs, allen_coords, allen_targets, allen_params_t, _acn, _asn = prepare_pde_tensors(allen_data, observation_steps=4 if smoke_test else 8)
 
             m_duffing = _eval_model_on_dataset(model_name, "duffing", duff_data, duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, "duffing", device, smoke_test, local_seed, max_epochs, callbacks)
             m_allen   = _eval_model_on_dataset(model_name, "allen_cahn", allen_data, allen_obs, allen_coords, allen_targets, allen_params_t, None, "allen_cahn", device, smoke_test, local_seed + 101, max_epochs, callbacks)

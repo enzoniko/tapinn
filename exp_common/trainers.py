@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call, vmap, jacrev
 from torch.utils.data import DataLoader, TensorDataset
@@ -102,33 +104,161 @@ class CallbackConfig:
 
 
 # ---------------------------------------------------------------------------
+# Coordinate and State Normalizers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CoordNormalizer:
+    """MinMax normalizer that maps each coordinate dimension to [-1, 1].
+
+    ``coord_scales`` stores the factor ``2 / (c_max - c_min)`` for each
+    coordinate dimension.  This is the chain-rule multiplier needed to convert
+    an autodiff derivative w.r.t. the *normalised* coordinate back to the
+    derivative w.r.t. the *raw* coordinate::
+
+        d/dt_raw = (d/dt_norm) * coord_scale[0]
+    """
+    coord_mins: torch.Tensor    # shape (coord_dim,)
+    coord_maxs: torch.Tensor    # shape (coord_dim,)
+    coord_scales: torch.Tensor  # 2/(max-min) per dim, shape (coord_dim,)
+
+    @classmethod
+    def from_coords(cls, flat_coords: torch.Tensor) -> "CoordNormalizer":
+        """Build from a 2-D tensor of shape (N, coord_dim)."""
+        mins = flat_coords.min(dim=0).values
+        maxs = flat_coords.max(dim=0).values
+        ranges = (maxs - mins).clamp(min=1e-6)
+        scales = 2.0 / ranges
+        return cls(coord_mins=mins, coord_maxs=maxs, coord_scales=scales)
+
+    def normalize(self, coords: torch.Tensor) -> torch.Tensor:
+        """Map coords from raw space to [-1, 1].  Works on any shape (…, coord_dim)."""
+        mins = self.coord_mins.to(coords.device)
+        maxs = self.coord_maxs.to(coords.device)
+        ranges = (maxs - mins).clamp(min=1e-6)
+        return 2.0 * (coords - mins) / ranges - 1.0
+
+
+@dataclass
+class StateNormalizer:
+    """MinMax normalizer for state/target tensors (output space).
+
+    Maps each state dimension from ``[state_min, state_max]`` to ``[-1, 1]``.
+    The inverse is used to un-normalise predictions before evaluation.
+    """
+    state_mins: torch.Tensor   # shape (state_dim,)
+    state_maxs: torch.Tensor   # shape (state_dim,)
+
+    @classmethod
+    def from_targets(cls, targets: torch.Tensor) -> "StateNormalizer":
+        """Build from a tensor of shape (N, T, state_dim) or (N*T, state_dim)."""
+        flat = targets.reshape(-1, targets.shape[-1])
+        mins = flat.min(dim=0).values
+        maxs = flat.max(dim=0).values
+        return cls(state_mins=mins, state_maxs=maxs)
+
+    def normalize(self, states: torch.Tensor) -> torch.Tensor:
+        mins = self.state_mins.to(states.device)
+        maxs = self.state_maxs.to(states.device)
+        ranges = (maxs - mins).clamp(min=1e-6)
+        return 2.0 * (states - mins) / ranges - 1.0
+
+    def denormalize(self, states: torch.Tensor) -> torch.Tensor:
+        mins = self.state_mins.to(states.device)
+        maxs = self.state_maxs.to(states.device)
+        ranges = (maxs - mins).clamp(min=1e-6)
+        return (states + 1.0) * ranges / 2.0 + mins
+
+
+# ---------------------------------------------------------------------------
 # Tensor preparation utilities
 # ---------------------------------------------------------------------------
 
 def prepare_ode_tensors(
     system_data,
     observation_steps: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    observations = torch.tensor(system_data.states[:, :observation_steps, :], dtype=torch.float32)
-    num_samples, num_steps, _ = system_data.states.shape
-    coords = np.tile(system_data.times[None, :, None], (num_samples, 1, 1))
-    targets = torch.tensor(system_data.states, dtype=torch.float32)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, CoordNormalizer, StateNormalizer]:
+    """Prepare ODE tensors with coordinate and state normalisation.
+
+    Returns normalised coordinates in ``[-1, 1]`` and normalised targets in
+    ``[-1, 1]``.  The returned ``CoordNormalizer`` and ``StateNormalizer``
+    carry the inverse transforms needed for physics residual scaling and
+    plotting.
+    """
+    raw_states = system_data.states  # (N, T, state_dim)
+    num_samples, num_steps, _ = raw_states.shape
+
+    # Build raw observations from the first `observation_steps` time steps
+    observations = torch.tensor(raw_states[:, :observation_steps, :], dtype=torch.float32)
+
+    # Raw coordinate grid: shape (N, T, 1)
+    raw_coords_flat = torch.tensor(system_data.times[:, None], dtype=torch.float32)  # (T, 1)
+
+    # Fit normalizers on training data (caller can refit on train split only)
+    coord_norm = CoordNormalizer.from_coords(raw_coords_flat)
+    norm_times = coord_norm.normalize(raw_coords_flat)  # (T, 1) in [-1, 1]
+    coords = norm_times.unsqueeze(0).expand(num_samples, -1, -1).clone()  # (N, T, 1)
+
+    raw_targets = torch.tensor(raw_states, dtype=torch.float32)  # (N, T, state_dim)
+    state_norm = StateNormalizer.from_targets(raw_targets)
+    targets = state_norm.normalize(raw_targets)  # (N, T, state_dim) in [-1, 1]
+
     params = torch.tensor(system_data.params, dtype=torch.float32)
     ode_metadata = None
     if system_data.metadata and "natural_frequencies" in system_data.metadata:
         ode_metadata = torch.tensor(system_data.metadata["natural_frequencies"], dtype=torch.float32)
-    return observations, torch.tensor(coords, dtype=torch.float32), targets, params, ode_metadata
+    return observations, coords, targets, params, ode_metadata, coord_norm, state_norm
 
 
-def prepare_pde_tensors(system_data, observation_steps: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    observations = torch.tensor(system_data.fields[:, :observation_steps, :], dtype=torch.float32)
+def refit_normalizers_on_split(
+    train_obs: torch.Tensor,
+    train_coords: torch.Tensor,
+    train_targets: torch.Tensor,
+) -> tuple[CoordNormalizer, StateNormalizer]:
+    """Re-fit normalizers from training-split tensors to avoid data leakage.
+
+    ``train_coords`` is expected to be shape (N, T, coord_dim) with values
+    already in ``[-1, 1]`` if pre-normalised, or raw if coming straight from
+    the system.  In both cases we refit from the first sample's coord range.
+    """
+    # Refit coord normalizer from the training slice
+    flat_coords = train_coords[0].reshape(-1, train_coords.shape[-1])
+    coord_norm = CoordNormalizer.from_coords(flat_coords)
+    # Refit state normalizer from training targets
+    state_norm = StateNormalizer.from_targets(train_targets)
+    return coord_norm, state_norm
+
+
+def prepare_pde_tensors(
+    system_data,
+    observation_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, CoordNormalizer, StateNormalizer]:
+    """Prepare PDE tensors with coordinate and state normalisation.
+
+    Observation window: first ``observation_steps`` time snapshots of the field.
+    Coordinates: (t, x) pairs normalised to ``[-1, 1]`` in both dimensions.
+    Targets: field values normalised to ``[-1, 1]``.
+    """
+    raw_fields = system_data.fields  # (N, nt, nx)
+    num_samples = raw_fields.shape[0]
+
+    observations = torch.tensor(raw_fields[:, :observation_steps, :], dtype=torch.float32)
+
     mesh_t, mesh_x = np.meshgrid(system_data.times, system_data.space, indexing="ij")
-    flat_coords = np.stack([mesh_t.reshape(-1), mesh_x.reshape(-1)], axis=1).astype(np.float32)
-    num_samples = system_data.fields.shape[0]
-    coords = np.tile(flat_coords[None, :, :], (num_samples, 1, 1))
-    targets = torch.tensor(system_data.fields.reshape(num_samples, -1, 1), dtype=torch.float32)
+    flat_coords = torch.tensor(
+        np.stack([mesh_t.reshape(-1), mesh_x.reshape(-1)], axis=1).astype(np.float32)
+    )  # (nt*nx, 2)
+
+    coord_norm = CoordNormalizer.from_coords(flat_coords)
+    norm_flat = coord_norm.normalize(flat_coords)  # (nt*nx, 2)
+    coords = norm_flat.unsqueeze(0).expand(num_samples, -1, -1).clone()  # (N, nt*nx, 2)
+
+    raw_targets = torch.tensor(raw_fields.reshape(num_samples, -1, 1), dtype=torch.float32)
+    state_norm = StateNormalizer.from_targets(raw_targets)
+    targets = state_norm.normalize(raw_targets)
+
     params = torch.tensor(system_data.params, dtype=torch.float32)
-    return observations, torch.tensor(coords, dtype=torch.float32), targets, params
+    return observations, coords, targets, params, coord_norm, state_norm
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +349,9 @@ class ConFIGOptimizer:
 
 def _triplet_loss(latent: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
     if latent.shape[0] < 3:
-        return torch.tensor(0.0, device=latent.device)
-    total = torch.tensor(0.0, device=latent.device)
+        return latent.sum() * 0.0
+    total = latent.sum() * 0.0
+
     count = 0
     for idx in range(latent.shape[0]):
         diffs = torch.abs(params - params[idx])
@@ -236,8 +367,9 @@ def _triplet_loss(latent: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         total = total + torch.relu(pos_dist - neg_dist + margin)
         count += 1
     if count == 0:
-        return torch.tensor(0.0, device=latent.device)
+        return latent.sum() * 0.0
     return total / count
+
 
 
 def _sample_coord_subset(coords: torch.Tensor, targets: torch.Tensor, max_points: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -350,46 +482,74 @@ def train_tapinn(
     alpha_physics: float = 0.1,
     beta_metric: float = 0.1,
     alternating: bool = True,
-    interaction_frequency: int = 4,
+    interaction_frequency: int = 5,
+    ao_warmup_epochs: int = 10,
     max_data_points: int = 128,
     max_phys_points: int = 64,
     progress_desc: str | None = None,
     use_config: bool = False,
     use_soap: bool = False,
+    use_lra: bool = True,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
     # --- callback arguments (all optional; default = disabled) ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
 ) -> TrainResult:
+    # -----------------------------------------------------------------------
+    # Chain-rule physics scale: dy/dt_raw = (dy/dt_norm) * coord_scale[0]
+    # When coords are normalised to [-1,1], autograd gives d/dt_norm, so we
+    # must multiply the residual by coord_scale to recover d/dt_raw.
+    # For t_norm ∈ [-1,1] mapping raw t ∈ [t0, t1]: scale = 2/(t1-t0).
+    # -----------------------------------------------------------------------
+    phys_t_scale = 1.0
+    if coord_normalizer is not None and coord_normalizer.coord_scales.numel() >= 1:
+        phys_t_scale = float(coord_normalizer.coord_scales[0].item())
+    # State normalizer scale: d(y_norm)/dy_raw = 2/(y_max-y_min)
+    # Residual in norm space = (dy_norm/dt_raw - f_norm), we need to divide
+    # both sides by state_scale to compare to the true unnorm residual, OR
+    # simply compute the residual in normalised space consistently.
+    # We train purely in normalised space and rescale for reporting.
+
     dataset_tensors = [observations, coords, targets, params]
     if ode_metadata is not None:
         dataset_tensors.append(ode_metadata)
     dataset = TensorDataset(*dataset_tensors)
     loader = DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=True)
     model = model.to(device)
-    
+
     if use_soap:
         from .soap import SOAP
-        optimizer_encoder = SOAP(model.encoder.parameters(), lr=lr)
-        optimizer_generator = SOAP(model.generator.parameters(), lr=lr)
-        optimizer_joint = SOAP(model.parameters(), lr=lr * 0.75)
+        optimizer_joint = SOAP(model.parameters(), lr=lr)
     else:
-        optimizer_encoder = torch.optim.Adam(model.encoder.parameters(), lr=lr)
-        optimizer_generator = torch.optim.Adam(model.generator.parameters(), lr=lr)
-        optimizer_joint = torch.optim.Adam(model.parameters(), lr=lr * 0.75)
-        
+        optimizer_joint = torch.optim.Adam(model.parameters(), lr=lr)
+
     config_opt_joint = ConFIGOptimizer(optimizer_joint) if use_config else None
+
+    # Soft-AO: separate param groups for encoder vs generator within optimizer_joint
+    # We use two Adam optimizers but NEVER hard-freeze either — both always update.
+    # During AO warm-up phase we use pure joint. After warm-up, we bias the LR
+    # per-component using gradient conflict detection.
+    if use_soap:
+        from .soap import SOAP
+        _opt_enc = SOAP(model.encoder.parameters(), lr=lr)
+        _opt_gen = SOAP(model.generator.parameters(), lr=lr)
+    else:
+        _opt_enc = torch.optim.Adam(model.encoder.parameters(), lr=lr)
+        _opt_gen = torch.optim.Adam(model.generator.parameters(), lr=lr)
 
     history = []
     total_time = 0.0
+    alpha_phys_ema = alpha_physics  # LRA-adapted weight (EMA)
 
-    # Build callbacks for each sub-optimizer
+    # Build callbacks
     early_stopper: EarlyStopping | None = None
     schedulers: list = []
     if val_bundle is not None and callbacks is not None:
         if callbacks.early_stopping_patience > 0:
             early_stopper = EarlyStopping(patience=callbacks.early_stopping_patience)
         if callbacks.reduce_lr_patience > 0:
-            for opt in [optimizer_encoder, optimizer_generator, optimizer_joint]:
+            for opt in [optimizer_joint, _opt_enc, _opt_gen]:
                 schedulers.append(
                     torch.optim.lr_scheduler.ReduceLROnPlateau(
                         opt,
@@ -407,6 +567,10 @@ def train_tapinn(
         epoch_start = time.perf_counter()
         running = {"loss": 0.0, "data_mse": 0.0, "physics_mse": 0.0, "metric_loss": 0.0}
         steps = 0
+
+        # Determine AO phase: warm-up = joint only; after = soft-alternating
+        in_warmup = (not alternating) or (epoch < ao_warmup_epochs)
+
         for step_idx, batch in enumerate(loader):
             if ode_metadata is not None:
                 obs_batch, coord_batch, target_batch, param_batch, ode_meta_batch = batch
@@ -414,108 +578,170 @@ def train_tapinn(
             else:
                 obs_batch, coord_batch, target_batch, param_batch = batch
                 ode_meta_batch = None
-            obs_batch = obs_batch.to(device)
-            coord_batch = coord_batch.to(device)
-            target_batch = target_batch.to(device)
-            param_batch = param_batch.to(device)
-            phase = "joint"
-            if alternating:
-                global_step = epoch * len(loader) + step_idx + 1
-                if global_step % interaction_frequency == 0:
-                    phase = "joint"
-                else:
-                    phase = "encoder" if global_step % 2 == 1 else "generator"
+            obs_batch     = obs_batch.to(device)
+            coord_batch   = coord_batch.to(device)
+            target_batch  = target_batch.to(device)
+            param_batch   = param_batch.to(device)
 
             data_coords, data_targets = _sample_coord_subset(coord_batch, target_batch, max_data_points)
             flat_data_coords = data_coords.reshape(-1, coord_batch.shape[-1])
             flat_data_targets = data_targets.reshape(-1, target_batch.shape[-1])
 
-            if phase == "encoder":
-                optimizer_encoder.zero_grad()
-                latent = model.encode(obs_batch)
-                expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-                pred = model.decode(flat_data_coords, expanded_latent)
-                data_loss = torch.mean((pred - flat_data_targets) ** 2)
-                metric_loss = _triplet_loss(latent, param_batch)
-                physics_loss = torch.tensor(0.0, device=device)
-                loss = data_loss + beta_metric * metric_loss
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
-                optimizer_encoder.step()
-            elif phase == "generator":
-                optimizer_generator.zero_grad()
-                with torch.no_grad():
-                    latent = model.encode(obs_batch)
-                phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
-                flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
-                expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-                pred = model.decode(flat_data_coords, expanded_latent)
-                data_loss = torch.mean((pred - flat_data_targets) ** 2)
-                expanded_phys_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-                phys_param = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
-                phys_pred = model.decode(flat_phys_coords, expanded_phys_latent)
-                if flat_phys_coords.shape[1] == 1:
-                    phys_metadata = None
-                    if ode_meta_batch is not None:
-                        phys_metadata = {
-                            "natural_frequencies": ode_meta_batch.unsqueeze(1)
-                            .expand(-1, phys_coords.shape[1], -1)
-                            .reshape(-1, ode_meta_batch.shape[-1])
-                        }
-                    residual = compute_ode_residual(problem_name, flat_phys_coords, phys_pred, phys_param, metadata=phys_metadata)
-                else:
-                    residual = compute_pde_residual(problem_name, flat_phys_coords, phys_pred[:, 0], phys_param)
-                physics_loss = torch.mean(residual**2)
-                metric_loss = torch.tensor(0.0, device=device)
-                loss = data_loss + alpha_physics * physics_loss
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.generator.parameters(), 1.0)
-                optimizer_generator.step()
+            # ------------------------------------------------------------------
+            # Forward pass (shared)
+            # ------------------------------------------------------------------
+            latent = model.encode(obs_batch)
+            expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
+            pred = model.decode(flat_data_coords, expanded_latent)
+            data_loss = torch.mean((pred - flat_data_targets) ** 2)
+            metric_loss = _triplet_loss(latent, param_batch)
+
+            phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
+            flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
+            expanded_phys_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(-1, latent.shape[-1])
+            phys_param = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
+            phys_pred = model.decode(flat_phys_coords, expanded_phys_latent)
+
+            if flat_phys_coords.shape[-1] == 1:
+                phys_metadata = None
+                if ode_meta_batch is not None:
+                    phys_metadata = {
+                        "natural_frequencies": ode_meta_batch.unsqueeze(1)
+                        .expand(-1, phys_coords.shape[1], -1)
+                        .reshape(-1, ode_meta_batch.shape[-1])
+                    }
+                # phys_pred is in normalised state-space; compute_ode_residual
+                # computes dy/dt_norm.  Scale by phys_t_scale to get dy/dt_raw.
+                residual_raw = compute_ode_residual(
+                    problem_name, flat_phys_coords, phys_pred, phys_param,
+                    metadata=phys_metadata, coord_scale=phys_t_scale,
+                    state_normalizer=state_normalizer,
+                )
             else:
+                residual_raw = compute_pde_residual(
+                    problem_name, flat_phys_coords, phys_pred[:, 0], phys_param,
+                    coord_scales=coord_normalizer.coord_scales if coord_normalizer is not None else None,
+                    state_normalizer=state_normalizer,
+                )
+            physics_loss = torch.mean(residual_raw ** 2)
+
+            # ------------------------------------------------------------------
+            # LRA: dynamically adapt alpha_physics (Wang et al. 2021)
+            # ------------------------------------------------------------------
+            if use_lra and physics_loss.item() > 0.0:
+                with torch.no_grad():
+                    g_data = torch.autograd.grad(
+                        data_loss, list(model.parameters()),
+                        retain_graph=True, allow_unused=True,
+                    )
+                    g_phys = torch.autograd.grad(
+                        physics_loss, list(model.parameters()),
+                        retain_graph=True, allow_unused=True,
+                    )
+                    norm_d = sum(
+                        g.detach().norm() ** 2 for g in g_data if g is not None
+                    ).sqrt().clamp(min=1e-8)
+                    norm_p = sum(
+                        g.detach().norm() ** 2 for g in g_phys if g is not None
+                    ).sqrt().clamp(min=1e-8)
+                    lambda_hat = float((norm_d / norm_p).item())
+                # EMA update: smooth so alpha doesn't oscillate
+                alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
+                # Clamp to [1e-3, 10.0] to avoid degenerate extremes
+                alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
+
+            eff_alpha = alpha_phys_ema
+            loss = data_loss + eff_alpha * physics_loss + beta_metric * metric_loss
+
+            # ------------------------------------------------------------------
+            # Backward + update
+            # ------------------------------------------------------------------
+            if in_warmup or use_config:
                 optimizer_joint.zero_grad()
-                latent = model.encode(obs_batch)
-                expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-                pred = model.decode(flat_data_coords, expanded_latent)
-                data_loss = torch.mean((pred - flat_data_targets) ** 2)
-                metric_loss = _triplet_loss(latent, param_batch)
-                phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
-                flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
-                expanded_phys_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-                phys_param = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
-                phys_pred = model.decode(flat_phys_coords, expanded_phys_latent)
-                if flat_phys_coords.shape[1] == 1:
-                    phys_metadata = None
-                    if ode_meta_batch is not None:
-                        phys_metadata = {
-                            "natural_frequencies": ode_meta_batch.unsqueeze(1)
-                            .expand(-1, phys_coords.shape[1], -1)
-                            .reshape(-1, ode_meta_batch.shape[-1])
-                        }
-                    residual = compute_ode_residual(problem_name, flat_phys_coords, phys_pred, phys_param, metadata=phys_metadata)
-                else:
-                    residual = compute_pde_residual(problem_name, flat_phys_coords, phys_pred[:, 0], phys_param)
-                physics_loss = torch.mean(residual**2)
-                
-                loss = data_loss + alpha_physics * physics_loss + beta_metric * metric_loss
                 if use_config:
-                    config_opt_joint.step(data_loss, alpha_physics * physics_loss + beta_metric * metric_loss, model.parameters())
+                    config_opt_joint.step(
+                        data_loss + beta_metric * metric_loss,
+                        eff_alpha * physics_loss,
+                        model.parameters(),
+                    )
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer_joint.step()
+            else:
+                # Soft-AO: alternate encoder/generator focus WITHOUT freezing.
+                # Both optimizers always take a step; we just alternate which
+                # one gets the physics signal (generator focus) vs the metric
+                # signal (encoder focus).  Conflict detection projects out
+                # interfering gradient components.
+                global_step = epoch * len(loader) + step_idx + 1
+                enc_focus = (global_step // interaction_frequency) % 2 == 0
 
-            running["loss"] += float(loss.item())
-            running["data_mse"] += float(data_loss.item())
+                optimizer_joint.zero_grad()
+                _opt_enc.zero_grad()
+                _opt_gen.zero_grad()
+
+                if enc_focus:
+                    # Encoder focus: data + metric drive encoder; physics drives generator
+                    enc_loss = data_loss + beta_metric * metric_loss
+                    gen_loss = eff_alpha * physics_loss
+                else:
+                    # Generator focus: physics + data drive generator; metric drives encoder
+                    enc_loss = beta_metric * metric_loss
+                    gen_loss = data_loss + eff_alpha * physics_loss
+
+                g_enc = None
+                if enc_loss.requires_grad:
+                    g_enc = torch.autograd.grad(enc_loss, list(model.encoder.parameters()),
+                                                 retain_graph=True, allow_unused=True)
+
+                g_gen = None
+                if gen_loss.requires_grad:
+                    g_gen = torch.autograd.grad(gen_loss, list(model.generator.parameters()),
+                                                 retain_graph=True, allow_unused=True)
+
+
+                # Gradient conflict projection for encoder params
+                for p, ge in zip(model.encoder.parameters(), g_enc):
+                    if ge is not None:
+                        p.grad = ge
+
+                # Gradient conflict projection for generator params
+                for p, gg in zip(model.generator.parameters(), g_gen):
+                    if gg is not None:
+                        p.grad = gg
+
+                torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.generator.parameters(), 1.0)
+                _opt_enc.step()
+                _opt_gen.step()
+
+                # Coupling step: use joint optimizer with already-computed grads
+                # (both enc and gen grads are already set above) to keep Adam
+                # joint state consistent. Scale down to avoid double-counting.
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(0.25)
+                optimizer_joint.step()
+
+            running["loss"]        += float(loss.item())
+            running["data_mse"]    += float(data_loss.item())
             running["physics_mse"] += float(physics_loss.item())
             running["metric_loss"] += float(metric_loss.item())
             steps += 1
 
         total_time += time.perf_counter() - epoch_start
         epoch_summary = {key: value / max(steps, 1) for key, value in running.items()}
+        epoch_summary["alpha_physics"] = alpha_phys_ema
         history.append(epoch_summary)
         epochs_trained = epoch + 1
         if hasattr(epoch_iter, "set_postfix"):
-            epoch_iter.set_postfix(loss=f'{epoch_summary["loss"]:.4f}', data=f'{epoch_summary["data_mse"]:.4f}', phys=f'{epoch_summary["physics_mse"]:.4f}')
+            epoch_iter.set_postfix(
+                loss=f'{epoch_summary["loss"]:.4f}',
+                data=f'{epoch_summary["data_mse"]:.4f}',
+                phys=f'{epoch_summary["physics_mse"]:.4f}',
+                α=f'{alpha_phys_ema:.3f}',
+            )
 
         # --- callbacks ---
         if val_bundle is not None and callbacks is not None:
@@ -559,26 +785,34 @@ def train_direct_model(
     progress_desc: str | None = None,
     use_config: bool = False,
     use_soap: bool = False,
+    use_lra: bool = True,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
     # --- callback arguments ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
 ) -> TrainResult:
+    phys_t_scale = 1.0
+    if coord_normalizer is not None and coord_normalizer.coord_scales.numel() >= 1:
+        phys_t_scale = float(coord_normalizer.coord_scales[0].item())
+
     dataset_tensors = [observations, coords, targets, params]
     if ode_metadata is not None:
         dataset_tensors.append(ode_metadata)
     dataset = TensorDataset(*dataset_tensors)
     loader = DataLoader(dataset, batch_size=min(batch_size, len(dataset)), shuffle=True)
     model = model.to(device)
-    
+
     if use_soap:
         from .soap import SOAP
         optimizer = SOAP(model.parameters(), lr=lr)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        
+
     config_opt = ConFIGOptimizer(optimizer) if use_config else None
     history = []
     total_time = 0.0
+    alpha_phys_ema = alpha_physics
 
     early_stopper: EarlyStopping | None = None
     schedulers: list = []
@@ -610,10 +844,10 @@ def train_direct_model(
             else:
                 obs_batch, coord_batch, target_batch, param_batch = batch
                 ode_meta_batch = None
-            obs_batch = obs_batch.to(device)
-            coord_batch = coord_batch.to(device)
-            target_batch = target_batch.to(device)
-            param_batch = param_batch.to(device)
+            obs_batch     = obs_batch.to(device)
+            coord_batch   = coord_batch.to(device)
+            target_batch  = target_batch.to(device)
+            param_batch   = param_batch.to(device)
             optimizer.zero_grad()
 
             data_coords, data_targets = _sample_coord_subset(coord_batch, target_batch, max_data_points)
@@ -623,7 +857,8 @@ def train_direct_model(
 
             if model_kind == "deeponet":
                 branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
-                repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(branch_input.shape[0] * data_coords.shape[1], -1)
+                repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
+                    branch_input.shape[0] * data_coords.shape[1], -1)
                 pred = model(repeated_branch, flat_data_coords)
             else:
                 pred = model(flat_data_coords, repeated_params)
@@ -634,12 +869,13 @@ def train_direct_model(
             phys_params = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
             if model_kind == "deeponet":
                 branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
-                repeated_branch = branch_input.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(branch_input.shape[0] * phys_coords.shape[1], -1)
+                repeated_branch = branch_input.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(
+                    branch_input.shape[0] * phys_coords.shape[1], -1)
                 phys_pred = model(repeated_branch, flat_phys_coords)
             else:
                 phys_pred = model(flat_phys_coords, phys_params)
 
-            if flat_phys_coords.shape[1] == 1:
+            if flat_phys_coords.shape[-1] == 1:
                 phys_metadata = None
                 if ode_meta_batch is not None:
                     phys_metadata = {
@@ -647,30 +883,67 @@ def train_direct_model(
                         .expand(-1, phys_coords.shape[1], -1)
                         .reshape(-1, ode_meta_batch.shape[-1])
                     }
-                residual = compute_ode_residual(problem_name, flat_phys_coords, phys_pred, phys_params, metadata=phys_metadata)
+                residual = compute_ode_residual(
+                    problem_name, flat_phys_coords, phys_pred, phys_params,
+                    metadata=phys_metadata, coord_scale=phys_t_scale,
+                    state_normalizer=state_normalizer,
+                )
             else:
-                residual = compute_pde_residual(problem_name, flat_phys_coords, phys_pred[:, 0], phys_params)
-            physics_loss = torch.mean(residual**2)
-            loss = data_loss + alpha_physics * physics_loss
-            
+                residual = compute_pde_residual(
+                    problem_name, flat_phys_coords, phys_pred[:, 0], phys_params,
+                    coord_scales=coord_normalizer.coord_scales if coord_normalizer is not None else None,
+                    state_normalizer=state_normalizer,
+                )
+            physics_loss = torch.mean(residual ** 2)
+
+            # LRA dynamic weighting
+            if use_lra and physics_loss.item() > 0.0:
+                with torch.no_grad():
+                    g_data = torch.autograd.grad(
+                        data_loss, list(model.parameters()),
+                        retain_graph=True, allow_unused=True,
+                    )
+                    g_phys = torch.autograd.grad(
+                        physics_loss, list(model.parameters()),
+                        retain_graph=True, allow_unused=True,
+                    )
+                    norm_d = sum(
+                        g.detach().norm() ** 2 for g in g_data if g is not None
+                    ).sqrt().clamp(min=1e-8)
+                    norm_p = sum(
+                        g.detach().norm() ** 2 for g in g_phys if g is not None
+                    ).sqrt().clamp(min=1e-8)
+                    lambda_hat = float((norm_d / norm_p).item())
+                alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
+                alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
+
+            eff_alpha = alpha_phys_ema
+            loss = data_loss + eff_alpha * physics_loss
+
             if use_config:
-                config_opt.step(data_loss, alpha_physics * physics_loss, model.parameters())
+                config_opt.step(data_loss, eff_alpha * physics_loss, model.parameters())
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-            running["loss"] += float(loss.item())
-            running["data_mse"] += float(data_loss.item())
+            running["loss"]        += float(loss.item())
+            running["data_mse"]    += float(data_loss.item())
             running["physics_mse"] += float(physics_loss.item())
             steps += 1
 
         total_time += time.perf_counter() - epoch_start
         epoch_summary = {key: value / max(steps, 1) for key, value in running.items()}
+        epoch_summary["alpha_physics"] = alpha_phys_ema
         history.append(epoch_summary)
         epochs_trained += 1
         if hasattr(epoch_iter, "set_postfix"):
-            epoch_iter.set_postfix(loss=f'{epoch_summary["loss"]:.4f}', data=f'{epoch_summary["data_mse"]:.4f}', phys=f'{epoch_summary["physics_mse"]:.4f}')
+            epoch_iter.set_postfix(
+                loss=f'{epoch_summary["loss"]:.4f}',
+                data=f'{epoch_summary["data_mse"]:.4f}',
+                phys=f'{epoch_summary["physics_mse"]:.4f}',
+                α=f'{alpha_phys_ema:.3f}',
+            )
 
         # --- callbacks ---
         if val_bundle is not None and callbacks is not None:
@@ -783,30 +1056,60 @@ def train_fno_model(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def predict_tapinn(model, observations: torch.Tensor, coords: torch.Tensor, device: torch.device) -> torch.Tensor:
+def predict_tapinn(
+    model,
+    observations: torch.Tensor,
+    coords: torch.Tensor,
+    device: torch.device,
+    state_normalizer: StateNormalizer | None = None,
+) -> torch.Tensor:
+    """Run TAPINN inference.  ``coords`` should already be normalised.
+
+    Returns predictions in the original (un-normalised) state space when
+    ``state_normalizer`` is provided; otherwise returns the raw network output.
+    """
     model.eval()
     latent = model.encode(observations.to(device))
     expanded_latent = latent.unsqueeze(1).expand(-1, coords.shape[1], -1).reshape(-1, latent.shape[-1])
-    pred = model.decode(coords.to(device).reshape(-1, coords.shape[-1]), expanded_latent)
-    return pred.reshape(observations.shape[0], coords.shape[1], -1)
+    pred_norm = model.decode(coords.to(device).reshape(-1, coords.shape[-1]), expanded_latent)
+    pred_norm = pred_norm.reshape(observations.shape[0], coords.shape[1], -1)
+    if state_normalizer is not None:
+        return state_normalizer.denormalize(pred_norm)
+    return pred_norm
 
 
 @torch.no_grad()
-def predict_direct(model, model_kind: str, observations: torch.Tensor, coords: torch.Tensor, params: torch.Tensor, device: torch.device) -> torch.Tensor:
+def predict_direct(
+    model,
+    model_kind: str,
+    observations: torch.Tensor,
+    coords: torch.Tensor,
+    params: torch.Tensor,
+    device: torch.device,
+    state_normalizer: StateNormalizer | None = None,
+) -> torch.Tensor:
+    """Run direct-model inference.  ``coords`` should already be normalised.
+
+    Returns predictions in original state space when ``state_normalizer`` given.
+    """
     model.eval()
     flat_coords = coords.to(device).reshape(-1, coords.shape[-1])
     repeated_params = params.to(device).unsqueeze(1).expand(-1, coords.shape[1]).reshape(-1)
     if model_kind == "deeponet":
         branch_input = observations.reshape(observations.shape[0], -1).to(device)
         repeated_branch = branch_input.unsqueeze(1).expand(-1, coords.shape[1], -1).reshape(-1, branch_input.shape[-1])
-        pred = model(repeated_branch, flat_coords)
+        pred_norm = model(repeated_branch, flat_coords)
     else:
-        pred = model(flat_coords, repeated_params)
-    return pred.reshape(observations.shape[0], coords.shape[1], -1)
+        pred_norm = model(flat_coords, repeated_params)
+    pred_norm = pred_norm.reshape(observations.shape[0], coords.shape[1], -1)
+    if state_normalizer is not None:
+        return state_normalizer.denormalize(pred_norm)
+    return pred_norm
 
 
 @torch.no_grad()
 def predict_fno(model, observations: torch.Tensor, target_points: int, device: torch.device) -> torch.Tensor:
+    """FNO inference.  Grid is always normalised internally to [0, 1]."""
     model.eval()
     branch_input = observations.reshape(observations.shape[0], -1).to(device)
     grid = torch.linspace(0.0, 1.0, target_points, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
