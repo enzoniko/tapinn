@@ -218,6 +218,61 @@ def prepare_ode_tensors(
     return observations, coords, targets, params, ode_metadata, coord_norm, state_norm
 
 
+def refit_normalizers_on_physical_split(
+    original_coord_norm: CoordNormalizer,
+    original_state_norm: StateNormalizer,
+    train_coords_normed: torch.Tensor,
+    train_targets_normed: torch.Tensor,
+    train_obs_normed: torch.Tensor,
+    val_targets_normed: torch.Tensor,
+    val_obs_normed: torch.Tensor,
+    test_targets_normed: torch.Tensor,
+    test_obs_normed: torch.Tensor,
+) -> tuple[
+    CoordNormalizer, StateNormalizer,
+    torch.Tensor, torch.Tensor, torch.Tensor,  # re-normed targets (train, val, test)
+    torch.Tensor, torch.Tensor, torch.Tensor,  # re-normed obs (train, val, test)
+]:
+    """Correctly refit normalizers by first mapping back to physical space.
+
+    BUG PREVENTION: refit_normalizers_on_split must receive PHYSICAL-SPACE
+    tensors.  Because prepare_ode_tensors already normalizes everything, this
+    helper reverses that normalization using the original normalizers before
+    refitting on the training partition only.
+    """
+    # 1. Denormalize to physical space using the CORRECT original normalizers
+    train_targets_phys = original_state_norm.denormalize(train_targets_normed)
+    val_targets_phys   = original_state_norm.denormalize(val_targets_normed)
+    test_targets_phys  = original_state_norm.denormalize(test_targets_normed)
+    
+    train_obs_phys     = original_state_norm.denormalize(train_obs_normed)
+    val_obs_phys       = original_state_norm.denormalize(val_obs_normed)
+    test_obs_phys      = original_state_norm.denormalize(test_obs_normed)
+
+    # 2. Refit state_norm on training targets IN PHYSICAL SPACE
+    new_state_norm = StateNormalizer.from_targets(train_targets_phys)
+
+    # 3. Coord_norm is inherited unchanged: it was built from raw system.times
+    # (all ODE/PDE samples share the same coordinate grid, so there is no
+    # leakage from using the full-dataset coord_norm)
+    new_coord_norm = original_coord_norm
+
+    # 4. Re-normalize all splits with the new training-based state_norm
+    train_targets_out = new_state_norm.normalize(train_targets_phys)
+    val_targets_out   = new_state_norm.normalize(val_targets_phys)
+    test_targets_out  = new_state_norm.normalize(test_targets_phys)
+    
+    train_obs_out     = new_state_norm.normalize(train_obs_phys)
+    val_obs_out       = new_state_norm.normalize(val_obs_phys)
+    test_obs_out      = new_state_norm.normalize(test_obs_phys)
+
+    return (
+        new_coord_norm, new_state_norm,
+        train_targets_out, val_targets_out, test_targets_out,
+        train_obs_out, val_obs_out, test_obs_out,
+    )
+
+
 def refit_normalizers_on_split(
     train_obs: torch.Tensor,
     train_coords: torch.Tensor,
@@ -225,12 +280,30 @@ def refit_normalizers_on_split(
 ) -> tuple[CoordNormalizer, StateNormalizer]:
     """Re-fit normalizers from training-split tensors to avoid data leakage.
 
-    ``train_coords`` is expected to be shape (N, T, coord_dim) with values
-    already in ``[-1, 1]`` if pre-normalised, or raw if coming straight from
-    the system.  In both cases we refit from the first sample's coord range.
+    WARNING: This function expects PHYSICAL-SPACE (un-normalized) tensors.
+    Passing already-normalized [-1, 1] tensors will produce wrong coord_scales
+    (≈1.0 instead of 2/T) causing silent physics residual corruption.
+
+    For the correct usage pattern with pre-normalized tensors from
+    prepare_ode_tensors / prepare_pde_tensors, use
+    refit_normalizers_on_physical_split() instead.
     """
     # Refit coord normalizer from the training slice
     flat_coords = train_coords[0].reshape(-1, train_coords.shape[-1])
+    
+    # Safety check: if coords appear already normalized to [-1, 1],
+    # the resulting coord_scales will be ≈1.0 (wrong for any T > 2).
+    coord_range = float((flat_coords.max() - flat_coords.min()).item())
+    if coord_range < 2.1 and flat_coords.min().item() > -1.1:
+         raise ValueError(
+            "refit_normalizers_on_split received coords that appear to be "
+            "already normalized to [-1, 1] (range={:.3f}, min={:.3f}). "
+            "This will produce coord_scales ≈ 1.0 instead of the correct "
+            "2/(t_max - t_min), silently corrupting all physics residuals. "
+            "Use refit_normalizers_on_physical_split() instead.".format(
+                coord_range, float(flat_coords.min().item()))
+        )
+
     coord_norm = CoordNormalizer.from_coords(flat_coords)
     # Refit state normalizer from training targets
     state_norm = StateNormalizer.from_targets(train_targets)
@@ -638,15 +711,19 @@ def train_tapinn(
             # LRA: dynamically adapt alpha_physics (Wang et al. 2021)
             # ------------------------------------------------------------------
             if use_lra and physics_loss.item() > 0.0:
+                # Compute gradient norms OUTSIDE torch.no_grad() so the second-order
+                # graph (built by _gradient with create_graph=True inside physics_loss)
+                # is fully traversable.
+                g_data = torch.autograd.grad(
+                    data_loss, list(model.parameters()),
+                    retain_graph=True, allow_unused=True, create_graph=False,
+                )
+                g_phys = torch.autograd.grad(
+                    physics_loss, list(model.parameters()),
+                    retain_graph=True, allow_unused=True, create_graph=False,
+                )
+                
                 with torch.no_grad():
-                    g_data = torch.autograd.grad(
-                        data_loss, list(model.parameters()),
-                        retain_graph=True, allow_unused=True,
-                    )
-                    g_phys = torch.autograd.grad(
-                        physics_loss, list(model.parameters()),
-                        retain_graph=True, allow_unused=True,
-                    )
                     norm_d = sum(
                         g.detach().norm() ** 2 for g in g_data if g is not None
                     ).sqrt().clamp(min=1e-8)
@@ -655,12 +732,14 @@ def train_tapinn(
                     ).sqrt().clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
                     # Clamp lambda_hat *before* EMA to prevent singular exploding gradients
-                    # from permanently skewing the physics weight.
                     lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
+                
                 # EMA update: smooth so alpha doesn't oscillate
                 alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
                 # Final clamp for redundancy
                 alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
+                # Explicitly delete gradient references to prevent accidental graph retention
+                del g_data, g_phys
 
             eff_alpha = alpha_phys_ema
             loss = data_loss + eff_alpha * physics_loss + beta_metric * metric_loss
@@ -902,17 +981,18 @@ def train_direct_model(
                 )
             physics_loss = torch.mean(residual ** 2)
 
-            # LRA dynamic weighting
             if use_lra and physics_loss.item() > 0.0:
+                # Compute gradient norms OUTSIDE torch.no_grad()
+                g_data = torch.autograd.grad(
+                    data_loss, list(model.parameters()),
+                    retain_graph=True, allow_unused=True, create_graph=False,
+                )
+                g_phys = torch.autograd.grad(
+                    physics_loss, list(model.parameters()),
+                    retain_graph=True, allow_unused=True, create_graph=False,
+                )
+                
                 with torch.no_grad():
-                    g_data = torch.autograd.grad(
-                        data_loss, list(model.parameters()),
-                        retain_graph=True, allow_unused=True,
-                    )
-                    g_phys = torch.autograd.grad(
-                        physics_loss, list(model.parameters()),
-                        retain_graph=True, allow_unused=True,
-                    )
                     norm_d = sum(
                         g.detach().norm() ** 2 for g in g_data if g is not None
                     ).sqrt().clamp(min=1e-8)
@@ -920,11 +1000,11 @@ def train_direct_model(
                         g.detach().norm() ** 2 for g in g_phys if g is not None
                     ).sqrt().clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
-                    # Clamp lambda_hat *before* EMA
                     lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
+                
                 alpha_phys_ema = 0.9 * alpha_phys_ema + 0.1 * lambda_hat
-                # Final clamp for redundancy
                 alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
+                del g_data, g_phys
 
             eff_alpha = alpha_phys_ema
             loss = data_loss + eff_alpha * physics_loss

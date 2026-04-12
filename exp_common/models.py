@@ -297,9 +297,9 @@ class ModelBundle:
     model: nn.Module
 
 
-SMALL_TAPINN_CONFIG = {"hidden_dim": 32, "latent_dim": 8}
-LARGE_TAPINN_CONFIG = {"hidden_dim": 72, "latent_dim": 8}
-HYPERPINN_MATCHED_HIDDEN_DIM = 32
+SMALL_TAPINN_CONFIG = {"hidden_dim": 64, "latent_dim": 16}
+LARGE_TAPINN_CONFIG = {"hidden_dim": 128, "latent_dim": 32}
+HYPERPINN_MATCHED_HIDDEN_DIM = 64
 
 
 def build_tapinn(obs_dim: int, coord_dim: int, output_dim: int, large: bool = False) -> TAPINN:

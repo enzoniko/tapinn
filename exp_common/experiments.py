@@ -41,6 +41,7 @@ from .trainers import (
     predict_tapinn,
     prepare_ode_tensors,
     prepare_pde_tensors,
+    refit_normalizers_on_physical_split,
     refit_normalizers_on_split,
     train_direct_model,
     train_fno_model,
@@ -558,7 +559,7 @@ def _run_ode_seed_all_models(
     if problem_name == "duffing":
         data = generate_duffing_dataset(
             param_values,
-            num_trajectories=1 if smoke_test else 20,
+            num_trajectories=1 if smoke_test else 100,
             num_points=num_points,
             t_span=(0.0, 16.0),
             seed=seed,
@@ -566,7 +567,7 @@ def _run_ode_seed_all_models(
     elif problem_name == "lorenz":
         data = generate_lorenz_dataset(
             param_values,
-            num_trajectories=1 if smoke_test else 12,
+            num_trajectories=1 if smoke_test else 60,
             num_points=num_points,
             t_span=(0.0, 4.5),
             seed=seed,
@@ -574,7 +575,7 @@ def _run_ode_seed_all_models(
     elif problem_name == "kuramoto":
         data = generate_kuramoto_dataset(
             param_values,
-            num_trajectories=1 if smoke_test else 12,
+            num_trajectories=1 if smoke_test else 60,
             num_points=num_points,
             t_span=(0.0, 10.0),
             num_oscillators=5,
@@ -598,11 +599,21 @@ def _run_ode_seed_all_models(
     test_ode_meta  = _subset_optional_tensor(test_idx,  ode_metadata)
 
     # Refit normalizers on training split only (no data leakage)
-    coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
-    # Re-apply normalisation on all splits using training-fit normalizers
-    train_targets = state_norm.normalize(state_norm.denormalize(train_targets))  # no-op after refit
-    val_targets   = state_norm.normalize(state_norm.denormalize(val_targets))
-    test_targets  = state_norm.normalize(state_norm.denormalize(test_targets))
+    (
+        coord_norm, state_norm,
+        train_targets, val_targets, test_targets,
+        train_obs, val_obs, test_obs,
+    ) = refit_normalizers_on_physical_split(
+        original_coord_norm=coord_norm,
+        original_state_norm=state_norm,
+        train_coords_normed=train_coords,
+        train_targets_normed=train_targets,
+        train_obs_normed=train_obs,
+        val_targets_normed=val_targets,
+        val_obs_normed=val_obs,
+        test_targets_normed=test_targets,
+        test_obs_normed=test_obs,
+    )
 
     val_bundle = ValBundle(
         observations=val_obs,
@@ -807,10 +818,10 @@ def run_exp_1_ode_chaos_suite(output_root: str, device_name: str, smoke_test: bo
         "lorenz":   [20.0, 24.74, 32.0] if smoke_test else np.linspace(18.0, 35.0, 7).tolist(),
         "kuramoto": [0.2,  1.0,   2.0]  if smoke_test else np.linspace(0.2, 3.0,  7).tolist(),
     }
-    max_epochs = 4 if smoke_test else 150
+    max_epochs = 4 if smoke_test else 10000
     callbacks = CallbackConfig(
-        early_stopping_patience=2 if smoke_test else 15,
-        reduce_lr_patience=1 if smoke_test else 8,
+        early_stopping_patience=2 if smoke_test else 50,
+        reduce_lr_patience=1 if smoke_test else 20,
         reduce_lr_factor=0.5,
         min_lr=1e-6,
     )
@@ -1120,17 +1131,36 @@ def run_exp_4_sensitivity_and_robustness(output_root: str, device_name: str, smo
                     set_global_seed(local_seed)
                     tensors = data_fn(local_seed)
                     obs, crds, trgs, prms = tensors[:4]
-                    meta_raw = tensors[4] if len(tensors) == 7 else None
+                    if len(tensors) == 7:
+                        # ODE case: (obs, coords, targets, params, metadata, cn, sn)
+                        meta_raw, orig_cn, orig_sn = tensors[4], tensors[5], tensors[6]
+                    else:
+                        # PDE case: (obs, coords, targets, params, cn, sn)
+                        meta_raw, orig_cn, orig_sn = None, tensors[4], tensors[5]
 
                     train_idx, val_idx, test_idx = _split_indices_three_way(len(prms), local_seed)
-
-                    # 2.2 Re-fit normalizers on training split for rigor
                     t_obs, t_crds, t_trgs, t_prms = _subset_tensors(train_idx, obs, crds, trgs, prms)
-                    c_norm, s_norm = refit_normalizers_on_split(t_obs, t_crds, t_trgs)
+                    v_obs, v_crds, v_trgs, v_prms = _subset_tensors(val_idx, obs, crds, trgs, prms)
+                    s_obs, s_crds, s_trgs, s_prms = _subset_tensors(test_idx, obs, crds, trgs, prms)
+                    (
+                        c_norm, s_norm,
+                        t_trgs, v_trgs, s_trgs,
+                        t_obs, v_obs_new, s_obs_new,
+                    ) = refit_normalizers_on_physical_split(
+                        original_coord_norm=orig_cn,
+                        original_state_norm=orig_sn,
+                        train_coords_normed=t_crds,
+                        train_targets_normed=t_trgs,
+                        train_obs_normed=t_obs,
+                        val_targets_normed=v_trgs,
+                        val_obs_normed=v_obs,
+                        test_targets_normed=s_trgs,
+                        test_obs_normed=s_obs,
+                    )
 
                     t_tup = (t_obs, t_crds, t_trgs, t_prms, _subset_optional_tensor(train_idx, meta_raw), s_norm, c_norm)
-                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta_raw), s_norm, c_norm)
-                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta_raw), s_norm, c_norm)
+                    v_tup = (v_obs_new, v_crds, v_trgs, v_prms, _subset_optional_tensor(val_idx, meta_raw), s_norm, c_norm)
+                    s_tup = (s_obs_new, s_crds, s_trgs, s_prms, _subset_optional_tensor(test_idx, meta_raw), s_norm, c_norm)
 
                     res = _eval_robustness_grid_point(model_name, problem_name, t_tup, v_tup, s_tup, noise, device, max_epochs, callbacks, local_seed)
 
@@ -1178,11 +1208,28 @@ def run_exp_4_sensitivity_and_robustness(output_root: str, device_name: str, smo
                     
                     # 3.2 Re-fit normalizers on training split
                     t_obs, t_crds, t_trgs, t_prms = _subset_tensors(train_idx, obs, crds, trgs, prms)
-                    c_norm, s_norm = refit_normalizers_on_split(t_obs, t_crds, t_trgs)
+                    v_obs, v_crds, v_trgs, v_prms = _subset_tensors(val_idx, obs, crds, trgs, prms)
+                    s_obs, s_crds, s_trgs, s_prms = _subset_tensors(test_idx, obs, crds, trgs, prms)
+                    
+                    (
+                        c_norm, s_norm,
+                        t_trgs, v_trgs, s_trgs,
+                        t_obs, v_obs_new, s_obs_new,
+                    ) = refit_normalizers_on_physical_split(
+                        original_coord_norm=_cn,
+                        original_state_norm=_sn,
+                        train_coords_normed=t_crds,
+                        train_targets_normed=t_trgs,
+                        train_obs_normed=t_obs,
+                        val_targets_normed=v_trgs,
+                        val_obs_normed=v_obs,
+                        test_targets_normed=s_trgs,
+                        test_obs_normed=s_obs,
+                    )
 
                     t_tup = (t_obs, t_crds, t_trgs, t_prms, _subset_optional_tensor(train_idx, meta), s_norm, c_norm)
-                    v_tup = tuple(_subset_tensors(val_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(val_idx, meta), s_norm, c_norm)
-                    s_tup = tuple(_subset_tensors(test_idx, obs, crds, trgs, prms)) + (_subset_optional_tensor(test_idx, meta), s_norm, c_norm)
+                    v_tup = (v_obs_new, v_crds, v_trgs, v_prms, _subset_optional_tensor(val_idx, meta), s_norm, c_norm)
+                    s_tup = (s_obs_new, s_crds, s_trgs, s_prms, _subset_optional_tensor(test_idx, meta), s_norm, c_norm)
 
                     res = _eval_robustness_grid_point(model_name, problem_name, t_tup, v_tup, s_tup, 0.0, device, max_epochs, callbacks, local_seed)
 
@@ -1380,7 +1427,21 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
             train_obs, train_coords, train_targets, train_params = _subset_tensors(train_idx, obs, coords, targets, params)
             test_obs,  test_coords,  test_targets,  test_params  = _subset_tensors(test_idx,  obs, coords, targets, params)
             # Refit normalizers on training split to prevent data leakage
-            coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
+            (
+                coord_norm, state_norm,
+                train_targets, _, test_targets,
+                train_obs, _, test_obs,
+            ) = refit_normalizers_on_physical_split(
+                original_coord_norm=coord_norm,
+                original_state_norm=state_norm,
+                train_coords_normed=train_coords,
+                train_targets_normed=train_targets,
+                train_obs_normed=train_obs,
+                val_targets_normed=torch.zeros_like(train_targets[0:1]), # Dummy
+                val_obs_normed=torch.zeros_like(train_obs[0:1]),        # Dummy
+                test_targets_normed=test_targets,
+                test_obs_normed=test_obs,
+            )
             train_meta = _subset_optional_tensor(train_idx, meta)
             test_meta  = _subset_optional_tensor(test_idx,  meta)
 
@@ -1636,7 +1697,7 @@ def _run_pde_seed_all_models(
     # ------------------------------------------------------------------
     # 1. Generate data
     # ------------------------------------------------------------------
-    num_samples_per_param = 1 if smoke_test else 6
+    num_samples_per_param = 1 if smoke_test else 24
     # KS is 4th-order PDE: autograd is O(N^4), so keep grid tiny in smoke mode
     if smoke_test and problem_name == "kuramoto_sivashinsky":
         nx, nt = 8, 6   # 48 physics points — manageable even on CPU
@@ -1666,7 +1727,21 @@ def _run_pde_seed_all_models(
     test_obs,  test_coords,  test_targets,  test_params  = _subset_tensors(test_idx,  observations, coords, targets, params)
 
     # Refit normalizers on training split only (no data leakage)
-    coord_norm, state_norm = refit_normalizers_on_split(train_obs, train_coords, train_targets)
+    (
+        coord_norm, state_norm,
+        train_targets, val_targets, test_targets,
+        train_obs, val_obs, test_obs,
+    ) = refit_normalizers_on_physical_split(
+        original_coord_norm=coord_norm,
+        original_state_norm=state_norm,
+        train_coords_normed=train_coords,
+        train_targets_normed=train_targets,
+        train_obs_normed=train_obs,
+        val_targets_normed=val_targets,
+        val_obs_normed=val_obs,
+        test_targets_normed=test_targets,
+        test_obs_normed=test_obs,
+    )
 
     val_bundle = ValBundle(
         observations=val_obs,
@@ -1773,10 +1848,10 @@ def run_exp_2_pde_spatiotemporal_suite(output_root: str, device_name: str, smoke
         "burgers":              [0.02, 0.05] if smoke_test else [0.015, 0.03, 0.05, 0.08],
         "kuramoto_sivashinsky": [0.8, 1.0]   if smoke_test else [0.75, 0.9, 1.05, 1.2],
     }
-    max_epochs = 4 if smoke_test else 100
+    max_epochs = 4 if smoke_test else 10000
     callbacks = CallbackConfig(
-        early_stopping_patience=2 if smoke_test else 15,
-        reduce_lr_patience=1 if smoke_test else 8,
+        early_stopping_patience=2 if smoke_test else 50,
+        reduce_lr_patience=1 if smoke_test else 20,
         reduce_lr_factor=0.5,
         min_lr=1e-6,
     )
