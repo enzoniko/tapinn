@@ -107,6 +107,8 @@ def _aggregate_ode_metrics(
     params: torch.Tensor,
     ode_metadata: torch.Tensor | None = None,
 ) -> tuple[float, float]:
+    predictions = np.asarray(predictions)
+    truth = np.asarray(truth)
     residuals = []
     for sample_idx, param in enumerate(params):
         metadata = None
@@ -125,6 +127,8 @@ def _aggregate_pde_metrics(
     params: torch.Tensor,
     boundary: str,
 ) -> tuple[float, float]:
+    predictions = np.asarray(predictions)
+    truth = np.asarray(truth)
     nt = len(times)
     nx = len(space)
     pred_fields = predictions[:, :, 0].reshape(predictions.shape[0], nt, nx)
@@ -136,6 +140,7 @@ def _aggregate_pde_metrics(
 
 
 def _forecast_mse(predictions: np.ndarray, targets: torch.Tensor, observed_steps: int) -> float:
+    predictions = np.asarray(predictions)
     target_np = targets.cpu().numpy()
     if observed_steps >= target_np.shape[1]:
         return mse(predictions, target_np)
@@ -368,16 +373,16 @@ def _measure_inference_ms(fn, sample_count: int, *args) -> tuple[np.ndarray, flo
     return output, elapsed_ms
 
 
-def _tapinn_predict_numpy(model, obs, coords, device) -> np.ndarray:
-    return predict_tapinn(model, obs, coords, device).detach().cpu().numpy()
+def _tapinn_predict_numpy(model, obs, coords, device, state_normalizer: StateNormalizer | None = None) -> np.ndarray:
+    return predict_tapinn(model, obs, coords, device, state_normalizer=state_normalizer).detach().cpu().numpy()
 
 
-def _direct_predict_numpy(model, kind: str, obs, coords, params, device) -> np.ndarray:
-    return predict_direct(model, kind, obs, coords, params, device).detach().cpu().numpy()
+def _direct_predict_numpy(model, kind: str, obs, coords, params, device, state_normalizer: StateNormalizer | None = None) -> np.ndarray:
+    return predict_direct(model, kind, obs, coords, params, device, state_normalizer=state_normalizer).detach().cpu().numpy()
 
 
-def _fno_predict_numpy(model, obs, points: int, device) -> np.ndarray:
-    return predict_fno(model, obs, points, device).detach().cpu().numpy()
+def _fno_predict_numpy(model, obs, points: int, device):
+    return predict_fno(model, obs, points, device)
 
 
 # ---------------------------------------------------------------------------
@@ -1509,6 +1514,7 @@ def run_exp_5_theoretical_optimization_landscape(output_root: str, device_name: 
     # Aggregates and Global Reporting
     _final_conditioning_summary_plot(condition_records, run_dir / "figures" / "global_conditioning_summary.pdf")
     write_csv(run_dir / "tables" / "seed_summary.csv", seed_rows)
+    write_csv(run_dir / "tables" / "summary.csv", seed_rows)
     write_json(run_dir / "results.json", {
         "device": str(device), "max_epochs": total_epochs,
         "seed_summary": seed_rows, "spectra": spectrum_records, "conditioning": condition_records
@@ -2028,15 +2034,20 @@ def _train_exp3_model(
     max_epochs: int,
     batch_size: int,
     seed: int,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
 ):
     """Dispatch training for any Exp-3 model variant."""
     desc = f"{model_name[:8]}-{problem_name[:8]}-s{seed}"
     family = _EXP3_MODELS[model_name][0]
     if family in ("tapinn", "tapinn_large"):
+        if coord_normalizer is None or state_normalizer is None:
+            raise ValueError("Exp 3 TAPINN training requires coord_normalizer and state_normalizer.")
         return train_tapinn(
             model, problem_name, train_obs, train_coords, train_targets, train_params,
             device, ode_metadata=train_ode_meta, epochs=max_epochs, batch_size=batch_size,
             progress_desc=desc, val_bundle=val_bundle, callbacks=callbacks,
+            coord_normalizer=coord_normalizer, state_normalizer=state_normalizer,
         )
     elif family == "fno":
         fno_val: ValBundle | None = None
@@ -2047,11 +2058,14 @@ def _train_exp3_model(
             progress_desc=desc, val_bundle=fno_val, callbacks=callbacks,
         )
     else:
+        if coord_normalizer is None or state_normalizer is None:
+            raise ValueError("Exp 3 direct-model training requires coord_normalizer and state_normalizer.")
         # direct family: standard, hyper, deeponet
         return train_direct_model(
             model, problem_name, family, train_obs, train_coords, train_targets, train_params,
             device, ode_metadata=train_ode_meta, epochs=max_epochs, batch_size=batch_size,
             progress_desc=desc, val_bundle=val_bundle, callbacks=callbacks,
+            coord_normalizer=coord_normalizer, state_normalizer=state_normalizer,
         )
 
 
@@ -2063,15 +2077,27 @@ def _predict_exp3_model(
     test_params: torch.Tensor,
     grid_size: int,
     device: torch.device,
+    state_normalizer: StateNormalizer | None = None,
 ) -> tuple[np.ndarray, float]:
     """Run inference for Exp-3 models; consistent with Exp 1 and 2."""
+    if state_normalizer is None:
+        raise ValueError("Exp 3 predictions require state_normalizer so outputs can be denormalized.")
     family = _EXP3_MODELS[model_name][0]
     if family in ("tapinn", "tapinn_large"):
-        return _measure_inference_ms(_tapinn_predict_numpy, test_obs.shape[0], model, test_obs, test_coords, device)
+        return _measure_inference_ms(
+            lambda *a: _tapinn_predict_numpy(*a, state_normalizer=state_normalizer),
+            test_obs.shape[0], model, test_obs, test_coords, device,
+        )
     elif family == "fno":
-        return _measure_inference_ms(_fno_predict_numpy, test_obs.shape[0], model, test_obs, grid_size, device)
+        return _measure_inference_ms(
+            lambda *a: state_normalizer.denormalize(predict_fno(*a)).detach().cpu().numpy(),
+            test_obs.shape[0], model, test_obs, grid_size, device,
+        )
     else:
-        return _measure_inference_ms(_direct_predict_numpy, test_obs.shape[0], model, family, test_obs, test_coords, test_params, device)
+        return _measure_inference_ms(
+            lambda *a: _direct_predict_numpy(*a, state_normalizer=state_normalizer),
+            test_obs.shape[0], model, family, test_obs, test_coords, test_params, device,
+        )
 
 
 def _eval_model_on_dataset(
@@ -2087,8 +2113,10 @@ def _eval_model_on_dataset(
     device: torch.device,
     smoke_test: bool,
     seed: int,
-    max_epochs: int,
-    callbacks: CallbackConfig,
+    max_epochs: int | None = None,
+    callbacks: CallbackConfig | None = None,
+    coord_normalizer: CoordNormalizer | None = None,
+    state_normalizer: StateNormalizer | None = None,
 ) -> dict:
     """Standardized evaluation for Experiment 3.
 
@@ -2099,6 +2127,15 @@ def _eval_model_on_dataset(
     * Calculates the 'generalization_gap' (MSE_test - MSE_train) to detect overfitting
       in high-capacity models (HyperPINN, TAPINN-Large).
     """
+    if max_epochs is None:
+        max_epochs = 4 if smoke_test else 100
+    if callbacks is None:
+        callbacks = CallbackConfig(
+            early_stopping_patience=2 if smoke_test else 15,
+            reduce_lr_patience=1 if smoke_test else 8,
+            reduce_lr_factor=0.5,
+            min_lr=1e-6,
+        )
     # ------------------------------------------------------------------
     # 1. Three-way split (70 / 15 / 15)
     # ------------------------------------------------------------------
@@ -2134,21 +2171,25 @@ def _eval_model_on_dataset(
         model_name, model, problem_name,
         train_obs, train_coords, train_targets, train_params, train_ode_meta,
         active_val_bundle, active_callbacks, device, max_epochs, batch_size=4, seed=seed,
+        coord_normalizer=coord_normalizer, state_normalizer=state_normalizer,
     )
 
-    preds, inference_ms = _predict_exp3_model(model_name, model, test_obs, test_coords, test_params, grid_size, device)
+    preds, inference_ms = _predict_exp3_model(
+        model_name, model, test_obs, test_coords, test_params, grid_size, device,
+        state_normalizer=state_normalizer,
+    )
 
     # Generalization gap check (using a separate call to train_pred for simplicity)
     family = _EXP3_MODELS[model_name][0]
     if family in ("tapinn", "tapinn_large"):
-        train_pred = _tapinn_predict_numpy(model, train_obs, train_coords, device)
+        train_pred = _tapinn_predict_numpy(model, train_obs, train_coords, device, state_normalizer=state_normalizer)
     elif family == "fno":
         train_pred = _fno_predict_numpy(model, train_obs, grid_size, device)
     else:
-        train_pred = _direct_predict_numpy(model, family, train_obs, train_coords, train_params, device)
+        train_pred = _direct_predict_numpy(model, family, train_obs, train_coords, train_params, device, state_normalizer=state_normalizer)
 
-    train_truth = train_targets.cpu().numpy()
-    test_truth = test_targets.cpu().numpy()
+    train_truth = state_normalizer.denormalize(train_targets).cpu().numpy()
+    test_truth = state_normalizer.denormalize(test_targets).cpu().numpy()
     gen_gap = float(mse(preds, test_truth) - mse(train_pred, train_truth))
 
     if task_name == "duffing":
@@ -2227,15 +2268,23 @@ def run_exp_3_sota_baselines_and_capacity(output_root: str, device_name: str, sm
             # Duffing: Increase task consistency with 10 trajectories instead of 1
             duff_params = [0.24, 0.38, 0.52] if smoke_test else np.linspace(0.2, 0.55, 7).tolist()
             duff_data = generate_duffing_dataset(duff_params, num_trajectories=1 if smoke_test else 10, num_points=56 if smoke_test else 160, t_span=(0.0, 16.0), seed=local_seed)
-            duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, _dcn, _dsn = prepare_ode_tensors(duff_data, observation_steps=8 if smoke_test else 20)
+            duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, duff_coord_norm, duff_state_norm = prepare_ode_tensors(duff_data, observation_steps=8 if smoke_test else 20)
 
             # Allen-Cahn: Increase samples from 1 to 8 instead of 1
             allen_params = [0.8, 1.1] if smoke_test else [0.75, 0.9, 1.05, 1.2]
             allen_data = generate_allen_cahn_dataset(allen_params, num_samples=1 if smoke_test else 8, nx=16 if smoke_test else 48, nt=16 if smoke_test else 36, seed=local_seed + 11)
-            allen_obs, allen_coords, allen_targets, allen_params_t, _acn, _asn = prepare_pde_tensors(allen_data, observation_steps=4 if smoke_test else 8)
+            allen_obs, allen_coords, allen_targets, allen_params_t, allen_coord_norm, allen_state_norm = prepare_pde_tensors(allen_data, observation_steps=4 if smoke_test else 8)
 
-            m_duffing = _eval_model_on_dataset(model_name, "duffing", duff_data, duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, "duffing", device, smoke_test, local_seed, max_epochs, callbacks)
-            m_allen   = _eval_model_on_dataset(model_name, "allen_cahn", allen_data, allen_obs, allen_coords, allen_targets, allen_params_t, None, "allen_cahn", device, smoke_test, local_seed + 101, max_epochs, callbacks)
+            m_duffing = _eval_model_on_dataset(
+                model_name, "duffing", duff_data, duff_obs, duff_coords, duff_targets, duff_params_t, duff_meta, "duffing",
+                device, smoke_test, local_seed, max_epochs, callbacks,
+                coord_normalizer=duff_coord_norm, state_normalizer=duff_state_norm,
+            )
+            m_allen   = _eval_model_on_dataset(
+                model_name, "allen_cahn", allen_data, allen_obs, allen_coords, allen_targets, allen_params_t, None, "allen_cahn",
+                device, smoke_test, local_seed + 101, max_epochs, callbacks,
+                coord_normalizer=allen_coord_norm, state_normalizer=allen_state_norm,
+            )
 
             per_task_seed_metrics.extend([{"seed": local_seed, **m_duffing}, {"seed": local_seed, **m_allen}])
 

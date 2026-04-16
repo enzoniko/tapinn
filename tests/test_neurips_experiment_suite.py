@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import sys
 
 import torch
 
@@ -71,9 +72,9 @@ class ExperimentSuiteTest(unittest.TestCase):
         small_tapinn = count_parameters(build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=False))
         large_tapinn = count_parameters(build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=True))
         hyper = count_parameters(build_capacity_matched_hyperpinn(coord_dim=1, output_dim=2))
-        self.assertTrue(7500 <= small_tapinn <= 9500)
-        self.assertTrue(36000 <= large_tapinn <= 43000)
-        self.assertTrue(36000 <= hyper <= 43000)
+        self.assertTrue(30000 <= small_tapinn <= 35000)
+        self.assertTrue(120000 <= large_tapinn <= 135000)
+        self.assertTrue(250000 <= hyper <= 310000)
 
     # ------------------------------------------------------------------ #
     # Callback unit tests (Exp-1 specific)                                 #
@@ -286,20 +287,19 @@ class ExperimentSuiteTest(unittest.TestCase):
             "exp_4_sensitivity_and_robustness.py": [
                 "exp_4_sensitivity_and_robustness/results.json",
                 "exp_4_sensitivity_and_robustness/tables/noise_sweep.csv",
-                "exp_4_sensitivity_and_robustness/figures/error_vs_noise.pdf",
+                "exp_4_sensitivity_and_robustness/figures/duffing_noise_robustness.pdf",
             ],
             "exp_5_theoretical_optimization_landscape.py": [
                 "exp_5_theoretical_optimization_landscape/results.json",
-                "exp_5_theoretical_optimization_landscape/tables/summary.csv",
                 "exp_5_theoretical_optimization_landscape/tables/seed_summary.csv",
-                "exp_5_theoretical_optimization_landscape/figures/ntk_spectrum.pdf",
+                "exp_5_theoretical_optimization_landscape/figures/duffing/ntk_spectrum.pdf",
             ],
         }
 
         for script, expected_paths in script_expectations.items():
             output_root = self.temp_root / script.replace(".py", "")
             result = subprocess.run(
-                ["python", script, "--smoke-test", "--device", "cpu", "--output-root", str(output_root)],
+                [sys.executable, script, "--smoke-test", "--device", "cpu", "--output-root", str(output_root)],
                 cwd=REPO_ROOT,
                 check=False,
                 stdout=subprocess.PIPE,

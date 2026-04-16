@@ -429,16 +429,44 @@ class ConFIGOptimizer:
         self.optimizer.zero_grad()
 
 
-def _triplet_loss(latent: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+def _soft_ao_step(
+    loss: torch.Tensor,
+    enc_optimizer,
+    gen_optimizer,
+    encoder_parameters,
+    generator_parameters,
+    *,
+    enc_focus: bool,
+    max_grad_norm: float = 1.0,
+) -> None:
+    encoder_parameters = list(encoder_parameters)
+    generator_parameters = list(generator_parameters)
+    active_optimizer = enc_optimizer if enc_focus else gen_optimizer
+    inactive_optimizer = gen_optimizer if enc_focus else enc_optimizer
+    active_parameters = encoder_parameters if enc_focus else generator_parameters
+    inactive_parameters = generator_parameters if enc_focus else encoder_parameters
+
+    active_optimizer.zero_grad()
+    inactive_optimizer.zero_grad()
+    loss.backward()
+
+    for parameter in inactive_parameters:
+        parameter.grad = None
+
+    torch.nn.utils.clip_grad_norm_(active_parameters, max_grad_norm)
+    active_optimizer.step()
+
+
+def _triplet_loss(latent: torch.Tensor, params: torch.Tensor, trajectory_ids: torch.Tensor) -> torch.Tensor:
     if latent.shape[0] < 3:
         return latent.sum() * 0.0
     total = latent.sum() * 0.0
 
     count = 0
     for idx in range(latent.shape[0]):
-        diffs = torch.abs(params - params[idx])
-        pos_candidates = torch.where((diffs < 1e-6) & (torch.arange(latent.shape[0], device=latent.device) != idx))[0]
-        neg_candidates = torch.where(diffs > torch.median(diffs))[0]
+        sample_indices = torch.arange(latent.shape[0], device=latent.device)
+        pos_candidates = torch.where((trajectory_ids == trajectory_ids[idx]) & (sample_indices != idx))[0]
+        neg_candidates = torch.where(trajectory_ids != trajectory_ids[idx])[0]
         if len(pos_candidates) == 0 or len(neg_candidates) == 0:
             continue
         pos = latent[pos_candidates[0]]
@@ -566,14 +594,15 @@ def train_tapinn(
     alternating: bool = True,
     interaction_frequency: int = 5,
     ao_warmup_epochs: int = 10,
-    max_data_points: int = 128,
-    max_phys_points: int = 64,
+    max_data_points: int = 512,
+    max_phys_points: int = 256,
     progress_desc: str | None = None,
     use_config: bool = False,
     use_soap: bool = False,
     use_lra: bool = True,
     coord_normalizer: CoordNormalizer | None = None,
     state_normalizer: StateNormalizer | None = None,
+    trajectory_ids: torch.Tensor | None = None,
     # --- callback arguments (all optional; default = disabled) ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
@@ -593,7 +622,12 @@ def train_tapinn(
     # simply compute the residual in normalised space consistently.
     # We train purely in normalised space and rescale for reporting.
 
-    dataset_tensors = [observations, coords, targets, params]
+    if trajectory_ids is None:
+        trajectory_ids = torch.arange(observations.shape[0], dtype=torch.long)
+    else:
+        trajectory_ids = trajectory_ids.to(dtype=torch.long)
+
+    dataset_tensors = [observations, coords, targets, params, trajectory_ids]
     if ode_metadata is not None:
         dataset_tensors.append(ode_metadata)
     dataset = TensorDataset(*dataset_tensors)
@@ -655,15 +689,16 @@ def train_tapinn(
 
         for step_idx, batch in enumerate(loader):
             if ode_metadata is not None:
-                obs_batch, coord_batch, target_batch, param_batch, ode_meta_batch = batch
+                obs_batch, coord_batch, target_batch, param_batch, trajectory_batch, ode_meta_batch = batch
                 ode_meta_batch = ode_meta_batch.to(device)
             else:
-                obs_batch, coord_batch, target_batch, param_batch = batch
+                obs_batch, coord_batch, target_batch, param_batch, trajectory_batch = batch
                 ode_meta_batch = None
             obs_batch     = obs_batch.to(device)
             coord_batch   = coord_batch.to(device)
             target_batch  = target_batch.to(device)
             param_batch   = param_batch.to(device)
+            trajectory_batch = trajectory_batch.to(device)
 
             data_coords, data_targets = _sample_coord_subset(coord_batch, target_batch, max_data_points)
             flat_data_coords = data_coords.reshape(-1, coord_batch.shape[-1])
@@ -676,7 +711,7 @@ def train_tapinn(
             expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
             pred = model.decode(flat_data_coords, expanded_latent)
             data_loss = torch.mean((pred - flat_data_targets) ** 2)
-            metric_loss = _triplet_loss(latent, param_batch)
+            metric_loss = _triplet_loss(latent, param_batch, trajectory_batch)
 
             phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
             flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
@@ -760,54 +795,18 @@ def train_tapinn(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer_joint.step()
             else:
-                # Soft-AO: alternate encoder/generator focus WITHOUT freezing.
-                # Both optimizers always take a step; we just alternate which
-                # one gets the physics signal (generator focus) vs the metric
-                # signal (encoder focus).  Conflict detection projects out
-                # interfering gradient components.
+                # Soft-AO: alternate encoder/generator focus while keeping the
+                # inactive optimizer's Adam state untouched.
                 global_step = epoch * len(loader) + step_idx + 1
                 enc_focus = (global_step // interaction_frequency) % 2 == 0
-
-                optimizer_joint.zero_grad()
-                _opt_enc.zero_grad()
-                _opt_gen.zero_grad()
-
-                if enc_focus:
-                    # Encoder focus: data + metric drive encoder; physics drives generator
-                    enc_loss = data_loss + beta_metric * metric_loss
-                    gen_loss = eff_alpha * physics_loss
-                else:
-                    # Generator focus: physics + data drive generator; metric drives encoder
-                    enc_loss = beta_metric * metric_loss
-                    gen_loss = data_loss + eff_alpha * physics_loss
-
-                g_enc = None
-                if enc_loss.requires_grad:
-                    g_enc = torch.autograd.grad(enc_loss, list(model.encoder.parameters()),
-                                                 retain_graph=True, allow_unused=True)
-
-                g_gen = None
-                if gen_loss.requires_grad:
-                    g_gen = torch.autograd.grad(gen_loss, list(model.generator.parameters()),
-                                                 retain_graph=True, allow_unused=True)
-
-
-                # Gradient conflict projection for encoder params
-                for p, ge in zip(model.encoder.parameters(), g_enc):
-                    if ge is not None:
-                        p.grad = ge
-
-                # Gradient conflict projection for generator params
-                for p, gg in zip(model.generator.parameters(), g_gen):
-                    if gg is not None:
-                        p.grad = gg
-
-                torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(model.generator.parameters(), 1.0)
-                if enc_focus:
-                    _opt_enc.step()
-                else:
-                    _opt_gen.step()
+                _soft_ao_step(
+                    loss,
+                    _opt_enc,
+                    _opt_gen,
+                    model.encoder.parameters(),
+                    model.generator.parameters(),
+                    enc_focus=enc_focus,
+                )
 
             running["loss"]        += float(loss.item())
             running["data_mse"]    += float(data_loss.item())
@@ -865,8 +864,8 @@ def train_direct_model(
     batch_size: int = 8,
     lr: float = 1e-3,
     alpha_physics: float = 0.1,
-    max_data_points: int = 128,
-    max_phys_points: int = 64,
+    max_data_points: int = 512,
+    max_phys_points: int = 256,
     progress_desc: str | None = None,
     use_config: bool = False,
     use_soap: bool = False,
