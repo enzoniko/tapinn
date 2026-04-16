@@ -30,8 +30,8 @@ class TrainResult:
     seconds_per_epoch: float
     epochs_trained: int = 0
     best_val_loss: float = float("inf")
-    ntk_eigenvalues: list[dict] = field(default_factory=list)
-    jacobian_conditions: list[dict] = field(default_factory=list)
+    ntk_eigenvalues: list[dict[str, float]] = field(default_factory=list)
+    jacobian_conditions: list[dict[str, float]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -370,9 +370,9 @@ def compute_jacobian_condition(residual_fn, model, coords):
     jac_fn = jacrev(residual_fn, argnums=0)
     jac_dict = jac_fn(params, buffers, coords)
 
-    J = torch.cat([j.flatten(start_dim=1) for j in jac_dict.values()], dim=1)
+    jacobian_matrix = torch.cat([j.flatten(start_dim=1) for j in jac_dict[0].values()], dim=1)
 
-    s = torch.linalg.svdvals(J)
+    s = torch.linalg.svdvals(jacobian_matrix)
     return s.max() / max(s.min().item(), 1e-12)
 
 def lipschitz_estimate(encoder, x):
@@ -387,9 +387,9 @@ def lipschitz_estimate(encoder, x):
         def f(inp):
             return encoder(inp)
         
-        J = jacobian(f, x_i, vectorize=False)
-        J = J.view(J.shape[1], -1)  # Reshape to (out_dim, flattened_in_dim)
-        norm = torch.linalg.matrix_norm(J, ord=2)
+        jac = jacobian(f, x_i, vectorize=False)
+        jac = jac.view(jac.shape[1], -1)  # Reshape to (out_dim, flattened_in_dim)
+        norm = torch.linalg.matrix_norm(jac, ord=2)
         norms.append(norm)
         
     if not norms:
@@ -538,15 +538,26 @@ def _compute_val_loss_direct(
     data_coords, data_targets = _sample_coord_subset(coords, targets, max_data_points)
     flat_coords = data_coords.reshape(-1, coords.shape[-1])
     flat_targets = data_targets.reshape(-1, targets.shape[-1])
-    repeated_params = params.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
-    if model_kind == "deeponet":
-        branch_input = obs.reshape(obs.shape[0], -1)
-        repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
-            branch_input.shape[0] * data_coords.shape[1], -1
-        )
-        pred = model(repeated_branch, flat_coords)
+    has_oc = hasattr(model, "observation_conditioner")
+    if has_oc:
+        if model_kind == "fno":
+            pred = model(data_coords, obs)
+        else:
+            latent = model.observation_conditioner(obs)
+            repeated_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
+                latent.shape[0] * data_coords.shape[1], -1
+            )
+            pred = model.decode(flat_coords, repeated_latent)
     else:
-        pred = model(flat_coords, repeated_params)
+        repeated_params = params.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
+        if model_kind == "deeponet":
+            branch_input = obs.reshape(obs.shape[0], -1)
+            repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
+                branch_input.shape[0] * data_coords.shape[1], -1
+            )
+            pred = model(repeated_branch, flat_coords)
+        else:
+            pred = model(flat_coords, repeated_params)
     loss = float(F.mse_loss(pred, flat_targets).item())
     model.train()
     return loss
@@ -660,7 +671,7 @@ def train_tapinn(
 
     # Build callbacks
     early_stopper: EarlyStopping | None = None
-    schedulers: list = []
+    schedulers: list[torch.optim.lr_scheduler.ReduceLROnPlateau] = []
     if val_bundle is not None and callbacks is not None:
         if callbacks.early_stopping_patience > 0:
             early_stopper = EarlyStopping(patience=callbacks.early_stopping_patience)
@@ -679,7 +690,7 @@ def train_tapinn(
     best_val_loss = float("inf")
     epochs_trained = 0
     epoch_iter = tqdm(range(epochs), desc=progress_desc or f"TAPINN[{problem_name}]", leave=False)
-    for epoch in epoch_iter:
+    for epoch in (epoch_iter if epoch_iter is not None else range(epochs)):
         epoch_start = time.perf_counter()
         running = {"loss": 0.0, "data_mse": 0.0, "physics_mse": 0.0, "metric_loss": 0.0}
         steps = 0
@@ -708,6 +719,7 @@ def train_tapinn(
             # Forward pass (shared)
             # ------------------------------------------------------------------
             latent = model.encode(obs_batch)
+            assert latent is not None
             expanded_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(-1, latent.shape[-1])
             pred = model.decode(flat_data_coords, expanded_latent)
             data_loss = torch.mean((pred - flat_data_targets) ** 2)
@@ -759,12 +771,8 @@ def train_tapinn(
                 )
                 
                 with torch.no_grad():
-                    norm_d = sum(
-                        g.detach().norm() ** 2 for g in g_data if g is not None
-                    ).sqrt().clamp(min=1e-8)
-                    norm_p = sum(
-                        g.detach().norm() ** 2 for g in g_phys if g is not None
-                    ).sqrt().clamp(min=1e-8)
+                    norm_d = torch.sqrt(sum((g.detach().norm() ** 2 for g in g_data if g is not None), torch.tensor(0.0, device=device))).clamp(min=1e-8)
+                    norm_p = torch.sqrt(sum((g.detach().norm() ** 2 for g in g_phys if g is not None), torch.tensor(0.0, device=device))).clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
                     # Clamp lambda_hat *before* EMA to prevent singular exploding gradients
                     lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
@@ -785,6 +793,7 @@ def train_tapinn(
             if in_warmup or use_config:
                 optimizer_joint.zero_grad()
                 if use_config:
+                    assert config_opt_joint is not None
                     config_opt_joint.step(
                         data_loss + beta_metric * metric_loss,
                         eff_alpha * physics_loss,
@@ -820,6 +829,7 @@ def train_tapinn(
         history.append(epoch_summary)
         epochs_trained = epoch + 1
         if hasattr(epoch_iter, "set_postfix"):
+            assert epoch_iter is not None
             epoch_iter.set_postfix(
                 loss=f'{epoch_summary["loss"]:.4f}',
                 data=f'{epoch_summary["data_mse"]:.4f}',
@@ -864,6 +874,10 @@ def train_direct_model(
     batch_size: int = 8,
     lr: float = 1e-3,
     alpha_physics: float = 0.1,
+    beta_metric: float = 0.1,
+    alternating: bool = True,
+    interaction_frequency: int = 5,
+    ao_warmup_epochs: int = 10,
     max_data_points: int = 512,
     max_phys_points: int = 256,
     progress_desc: str | None = None,
@@ -872,6 +886,7 @@ def train_direct_model(
     use_lra: bool = True,
     coord_normalizer: CoordNormalizer | None = None,
     state_normalizer: StateNormalizer | None = None,
+    trajectory_ids: torch.Tensor | None = None,
     # --- callback arguments ---
     val_bundle: ValBundle | None = None,
     callbacks: CallbackConfig | None = None,
@@ -880,7 +895,14 @@ def train_direct_model(
     if coord_normalizer is not None and coord_normalizer.coord_scales.numel() >= 1:
         phys_t_scale = float(coord_normalizer.coord_scales[0].item())
 
-    dataset_tensors = [observations, coords, targets, params]
+    has_oc = hasattr(model, "observation_conditioner")
+    has_physics = getattr(model, "has_physics_loss", True)
+    if trajectory_ids is None:
+        trajectory_ids = torch.arange(observations.shape[0], dtype=torch.long)
+    else:
+        trajectory_ids = trajectory_ids.to(dtype=torch.long)
+
+    dataset_tensors = [observations, coords, targets, params, trajectory_ids]
     if ode_metadata is not None:
         dataset_tensors.append(ode_metadata)
     dataset = TensorDataset(*dataset_tensors)
@@ -893,13 +915,26 @@ def train_direct_model(
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    _opt_enc = None
+    _opt_gen = None
+    if has_oc and has_physics:
+        encoder_parameters = list(model.observation_conditioner.parameters())
+        generator_parameters = list(model.generator.parameters())
+        if use_soap:
+            from .soap import SOAP
+            _opt_enc = SOAP(encoder_parameters, lr=lr)
+            _opt_gen = SOAP(generator_parameters, lr=lr)
+        else:
+            _opt_enc = torch.optim.Adam(encoder_parameters, lr=lr)
+            _opt_gen = torch.optim.Adam(generator_parameters, lr=lr)
+
     config_opt = ConFIGOptimizer(optimizer) if use_config else None
     history = []
     total_time = 0.0
     alpha_phys_ema = alpha_physics
 
     early_stopper: EarlyStopping | None = None
-    schedulers: list = []
+    schedulers: list[torch.optim.lr_scheduler.ReduceLROnPlateau] = []
     if val_bundle is not None and callbacks is not None:
         if callbacks.early_stopping_patience > 0:
             early_stopper = EarlyStopping(patience=callbacks.early_stopping_patience)
@@ -917,70 +952,101 @@ def train_direct_model(
     best_val_loss = float("inf")
     epochs_trained = 0
     epoch_iter = tqdm(range(epochs), desc=progress_desc or f"{model_kind}[{problem_name}]", leave=False)
-    for _ in epoch_iter:
+    for epoch in (epoch_iter if epoch_iter is not None else range(epochs)):
         epoch_start = time.perf_counter()
         running = {"loss": 0.0, "data_mse": 0.0, "physics_mse": 0.0}
+        if has_oc:
+            running["metric_loss"] = 0.0
         steps = 0
-        for batch in loader:
+        in_warmup = (not alternating) or (epoch < ao_warmup_epochs)
+        for step_idx, batch in enumerate(loader):
+            latent: torch.Tensor | None = None
             if ode_metadata is not None:
-                obs_batch, coord_batch, target_batch, param_batch, ode_meta_batch = batch
+                obs_batch, coord_batch, target_batch, param_batch, trajectory_batch, ode_meta_batch = batch
                 ode_meta_batch = ode_meta_batch.to(device)
             else:
-                obs_batch, coord_batch, target_batch, param_batch = batch
+                obs_batch, coord_batch, target_batch, param_batch, trajectory_batch = batch
                 ode_meta_batch = None
             obs_batch     = obs_batch.to(device)
             coord_batch   = coord_batch.to(device)
             target_batch  = target_batch.to(device)
             param_batch   = param_batch.to(device)
+            trajectory_batch = trajectory_batch.to(device)
             optimizer.zero_grad()
 
             data_coords, data_targets = _sample_coord_subset(coord_batch, target_batch, max_data_points)
             flat_data_coords = data_coords.reshape(-1, coord_batch.shape[-1])
             flat_data_targets = data_targets.reshape(-1, target_batch.shape[-1])
-            repeated_params = param_batch.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
-
-            if model_kind == "deeponet":
-                branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
-                repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
-                    branch_input.shape[0] * data_coords.shape[1], -1)
-                pred = model(repeated_branch, flat_data_coords)
+            if has_oc:
+                latent = model.observation_conditioner(obs_batch)
+                assert latent is not None
+                metric_loss = _triplet_loss(latent, param_batch, trajectory_batch)
+                if model_kind == "fno":
+                    pred = model.decode(data_coords, latent)
+                    flat_data_targets = data_targets
+                else:
+                    repeated_latent = latent.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
+                        latent.shape[0] * data_coords.shape[1], -1
+                    )
+                    pred = model.decode(flat_data_coords, repeated_latent)
             else:
-                pred = model(flat_data_coords, repeated_params)
+                metric_loss = data_coords.sum() * 0.0
+                repeated_params = param_batch.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
+                if model_kind == "deeponet":
+                    branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
+                    repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
+                        branch_input.shape[0] * data_coords.shape[1], -1)
+                    pred = model(repeated_branch, flat_data_coords)
+                elif model_kind == "fno":
+                    branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
+                    pred = model(branch_input, data_coords)
+                    flat_data_targets = data_targets
+                else:
+                    pred = model(flat_data_coords, repeated_params)
             data_loss = torch.mean((pred - flat_data_targets) ** 2)
 
-            phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
-            flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
-            phys_params = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
-            if model_kind == "deeponet":
-                branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
-                repeated_branch = branch_input.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(
-                    branch_input.shape[0] * phys_coords.shape[1], -1)
-                phys_pred = model(repeated_branch, flat_phys_coords)
-            else:
-                phys_pred = model(flat_phys_coords, phys_params)
+            if has_physics:
+                phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
+                flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
+                phys_params = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
+                if has_oc:
+                    assert latent is not None
+                    repeated_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(
+                        latent.shape[0] * phys_coords.shape[1], -1
+                    )
+                    phys_pred = model.decode(flat_phys_coords, repeated_latent)
+                elif model_kind == "deeponet":
+                    branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
+                    repeated_branch = branch_input.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(
+                        branch_input.shape[0] * phys_coords.shape[1], -1)
+                    phys_pred = model(repeated_branch, flat_phys_coords)
+                else:
+                    phys_pred = model(flat_phys_coords, phys_params)
 
-            if flat_phys_coords.shape[-1] == 1:
-                phys_metadata = None
-                if ode_meta_batch is not None:
-                    phys_metadata = {
-                        "natural_frequencies": ode_meta_batch.unsqueeze(1)
-                        .expand(-1, phys_coords.shape[1], -1)
-                        .reshape(-1, ode_meta_batch.shape[-1])
-                    }
-                residual = compute_ode_residual(
-                    problem_name, flat_phys_coords, phys_pred, phys_params,
-                    metadata=phys_metadata, coord_normalizer=coord_normalizer,
-                    state_normalizer=state_normalizer,
-                )
+                if flat_phys_coords.shape[-1] == 1:
+                    phys_metadata = None
+                    if ode_meta_batch is not None:
+                        phys_metadata = {
+                            "natural_frequencies": ode_meta_batch.unsqueeze(1)
+                            .expand(-1, phys_coords.shape[1], -1)
+                            .reshape(-1, ode_meta_batch.shape[-1])
+                        }
+                    residual = compute_ode_residual(
+                        problem_name, flat_phys_coords, phys_pred, phys_params,
+                        metadata=phys_metadata, coord_normalizer=coord_normalizer,
+                        state_normalizer=state_normalizer,
+                    )
+                else:
+                    residual = compute_pde_residual(
+                        problem_name, flat_phys_coords, phys_pred[:, 0], phys_params,
+                        coord_scales=coord_normalizer.coord_scales if coord_normalizer is not None else None,
+                        state_normalizer=state_normalizer,
+                    )
+                physics_loss = torch.mean(residual ** 2)
             else:
-                residual = compute_pde_residual(
-                    problem_name, flat_phys_coords, phys_pred[:, 0], phys_params,
-                    coord_scales=coord_normalizer.coord_scales if coord_normalizer is not None else None,
-                    state_normalizer=state_normalizer,
-                )
-            physics_loss = torch.mean(residual ** 2)
+                physics_loss = data_loss * 0.0
 
-            if use_lra and physics_loss.item() > 0.0:
+            if has_physics and use_lra and physics_loss.item() > 0.0:
                 # Compute gradient norms OUTSIDE torch.no_grad()
                 g_data = torch.autograd.grad(
                     data_loss, list(model.parameters()),
@@ -992,12 +1058,8 @@ def train_direct_model(
                 )
                 
                 with torch.no_grad():
-                    norm_d = sum(
-                        g.detach().norm() ** 2 for g in g_data if g is not None
-                    ).sqrt().clamp(min=1e-8)
-                    norm_p = sum(
-                        g.detach().norm() ** 2 for g in g_phys if g is not None
-                    ).sqrt().clamp(min=1e-8)
+                    norm_d = torch.sqrt(sum((g.detach().norm() ** 2 for g in g_data if g is not None), torch.tensor(0.0, device=device))).clamp(min=1e-8)
+                    norm_p = torch.sqrt(sum((g.detach().norm() ** 2 for g in g_phys if g is not None), torch.tensor(0.0, device=device))).clamp(min=1e-8)
                     lambda_hat = float((norm_d / norm_p).item())
                     lambda_hat = float(np.clip(lambda_hat, 1e-3, 100.0))
                 
@@ -1005,11 +1067,29 @@ def train_direct_model(
                 alpha_phys_ema = float(np.clip(alpha_phys_ema, 1e-3, 10.0))
                 del g_data, g_phys
 
-            eff_alpha = alpha_phys_ema
-            loss = data_loss + eff_alpha * physics_loss
+            eff_alpha = alpha_phys_ema if has_physics else 0.0
+            if has_oc and has_physics:
+                loss = data_loss + eff_alpha * physics_loss + beta_metric * metric_loss
+            elif has_oc:
+                loss = data_loss + beta_metric * metric_loss
+            else:
+                loss = data_loss + eff_alpha * physics_loss
 
             if use_config:
+                assert config_opt is not None
                 config_opt.step(data_loss, eff_alpha * physics_loss, model.parameters())
+            elif has_oc and has_physics and not in_warmup:
+                global_step = epoch * len(loader) + step_idx + 1
+                enc_focus = (global_step // interaction_frequency) % 2 == 0
+                assert _opt_enc is not None and _opt_gen is not None
+                _soft_ao_step(
+                    loss,
+                    _opt_enc,
+                    _opt_gen,
+                    model.observation_conditioner.parameters(),
+                    model.generator.parameters(),
+                    enc_focus=enc_focus,
+                )
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1018,6 +1098,8 @@ def train_direct_model(
             running["loss"]        += float(loss.item())
             running["data_mse"]    += float(data_loss.item())
             running["physics_mse"] += float(physics_loss.item())
+            if has_oc:
+                running["metric_loss"] += float(metric_loss.item())
             steps += 1
 
         total_time += time.perf_counter() - epoch_start
@@ -1026,6 +1108,7 @@ def train_direct_model(
         history.append(epoch_summary)
         epochs_trained += 1
         if hasattr(epoch_iter, "set_postfix"):
+            assert epoch_iter is not None
             epoch_iter.set_postfix(
                 loss=f'{epoch_summary["loss"]:.4f}',
                 data=f'{epoch_summary["data_mse"]:.4f}',
@@ -1079,7 +1162,7 @@ def train_fno_model(
     total_time = 0.0
 
     early_stopper: EarlyStopping | None = None
-    schedulers: list = []
+    schedulers: list[torch.optim.lr_scheduler.ReduceLROnPlateau] = []
     if val_bundle is not None and callbacks is not None:
         if callbacks.early_stopping_patience > 0:
             early_stopper = EarlyStopping(patience=callbacks.early_stopping_patience)
@@ -1097,7 +1180,7 @@ def train_fno_model(
     best_val_loss = float("inf")
     epochs_trained = 0
     epoch_iter = tqdm(range(epochs), desc=progress_desc or "FNO", leave=False)
-    for _ in epoch_iter:
+    for _ in (epoch_iter if epoch_iter is not None else range(epochs)):
         epoch_start = time.perf_counter()
         running = {"loss": 0.0}
         steps = 0
@@ -1118,6 +1201,7 @@ def train_fno_model(
         history.append(epoch_summary)
         epochs_trained += 1
         if hasattr(epoch_iter, "set_postfix"):
+            assert epoch_iter is not None
             epoch_iter.set_postfix(loss=f'{epoch_summary["loss"]:.4f}')
 
         # --- callbacks ---
