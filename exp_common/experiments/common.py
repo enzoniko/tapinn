@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 import time
+from collections.abc import Iterable
+from types import MethodType
 from pathlib import Path
+from typing import cast
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -56,12 +61,35 @@ except Exception:  # pragma: no cover - fallback only
         return iterable
 
 
+_EXP_EPOCHS_ENV = "TAPINN_EXPERIMENT_EPOCHS"
+_EXP_ALL_CONFIGS_ENV = "TAPINN_EXPERIMENT_ALL_CONFIGS"
+
+
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--output-root", default="./neurips_results", help="Directory for metrics and figures.")
     parser.add_argument("--device", default="auto", help="Device override: auto, cpu, cuda, or mps.")
     parser.add_argument("--smoke-test", action="store_true", help="Run a tiny configuration for validation.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
+    parser.add_argument("--epochs", type=int, default=1000, help="Optional training epoch override for compatible experiments.")
+    parser.add_argument("--all-configs", action="store_true", help="Run all model configurations even in smoke-test mode where supported.")
+
+    original_parse_args = parser.parse_args
+
+    def _parse_args_with_env(
+        self: argparse.ArgumentParser,
+        args: Iterable[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        raw_args = list(sys.argv[1:] if args is None else args)
+        parsed = cast(argparse.Namespace, original_parse_args(args=args, namespace=namespace))
+        if "--epochs" in raw_args:
+            os.environ[_EXP_EPOCHS_ENV] = str(parsed.epochs)
+        if "--all-configs" in raw_args:
+            os.environ[_EXP_ALL_CONFIGS_ENV] = "1" if parsed.all_configs else "0"
+        return parsed
+
+    parser.parse_args = MethodType(_parse_args_with_env, parser)
     return parser
 
 
@@ -391,4 +419,3 @@ def _direct_predict_numpy(model, kind: str, obs, coords, params, device, state_n
 
 def _fno_predict_numpy(model, obs, points: int, device):
     return predict_fno(model, obs, points, device)
-
