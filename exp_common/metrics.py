@@ -2,14 +2,46 @@ from __future__ import annotations
 
 import statistics
 import time
-from typing import Iterable
+from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 
 
-def mse(pred: np.ndarray, target: np.ndarray) -> float:
+def mse(pred: NDArray[Any], target: NDArray[Any]) -> float:
+    pred = np.asarray(pred)
+    target = np.asarray(target)
     return float(np.mean((pred - target) ** 2))
+
+
+def compute_relative_l2_error(pred: NDArray[Any], target: NDArray[Any]) -> float:
+    pred = np.asarray(pred).ravel()
+    target = np.asarray(target).ravel()
+    diff_norm = float(np.linalg.norm(pred - target))
+    target_norm = float(np.linalg.norm(target))
+    if target_norm < 1e-8:
+        return diff_norm
+    return diff_norm / target_norm
+
+
+def compute_disambiguation_score(embeddings: NDArray[Any], trajectory_ids: list[Any]) -> float:
+    embeddings = np.asarray(embeddings)
+    trajectory_ids = list(trajectory_ids)
+    if embeddings.shape[0] < 2:
+        return 0.0
+    if len(set(trajectory_ids)) < 2:
+        return 0.0
+
+    from sklearn.metrics import silhouette_score
+
+    try:
+        silhouette = float(silhouette_score(embeddings, trajectory_ids))
+    except Exception:
+        return 0.0
+    score = (silhouette + 1.0) / 2.0
+    return float(np.clip(score, 0.0, 1.0))
 
 
 def mean_std(values: Iterable[float]) -> tuple[float, float]:
@@ -28,17 +60,20 @@ def timed_call(fn, *args, **kwargs):
     return out, elapsed
 
 
-def _dx(values: np.ndarray, step: float, axis: int) -> np.ndarray:
+def _dx(values: NDArray[Any], step: float, axis: int) -> NDArray[Any]:
     return np.gradient(values, step, axis=axis, edge_order=2)
 
 
 def numerical_ode_residual(
     problem_name: str,
-    times: np.ndarray,
-    states: np.ndarray,
+    times: NDArray[Any],
+    states: NDArray[Any],
     param: float,
-    metadata: dict[str, np.ndarray] | None = None,
+    metadata: dict[str, NDArray[Any]] | None = None,
 ) -> float:
+    times = np.asarray(times)
+    states = np.asarray(states)
+    param = float(param)
     dt = float(times[1] - times[0])
     derivatives = _dx(states, dt, axis=0)
     if problem_name == "duffing":
@@ -62,15 +97,15 @@ def numerical_ode_residual(
     return float(np.mean((derivatives - rhs) ** 2))
 
 
-def _periodic_dx(field: np.ndarray, dx: float) -> np.ndarray:
+def _periodic_dx(field: NDArray[Any], dx: float) -> NDArray[Any]:
     return (np.roll(field, -1, axis=1) - np.roll(field, 1, axis=1)) / (2.0 * dx)
 
 
-def _periodic_dxx(field: np.ndarray, dx: float) -> np.ndarray:
+def _periodic_dxx(field: NDArray[Any], dx: float) -> NDArray[Any]:
     return (np.roll(field, -1, axis=1) - 2.0 * field + np.roll(field, 1, axis=1)) / (dx * dx)
 
 
-def _periodic_dxxxx(field: np.ndarray, dx: float) -> np.ndarray:
+def _periodic_dxxxx(field: NDArray[Any], dx: float) -> NDArray[Any]:
     return (
         np.roll(field, -2, axis=1)
         - 4.0 * np.roll(field, -1, axis=1)
@@ -82,12 +117,16 @@ def _periodic_dxxxx(field: np.ndarray, dx: float) -> np.ndarray:
 
 def numerical_pde_residual(
     problem_name: str,
-    times: np.ndarray,
-    space: np.ndarray,
-    field: np.ndarray,
+    times: NDArray[Any],
+    space: NDArray[Any],
+    field: NDArray[Any],
     param: float,
     boundary: str = "periodic",
 ) -> float:
+    times = np.asarray(times)
+    space = np.asarray(space)
+    field = np.asarray(field)
+    param = float(param)
     dt = float(times[1] - times[0])
     dx = float(space[1] - space[0])
     u_t = _dx(field, dt, axis=0)
@@ -110,5 +149,5 @@ def numerical_pde_residual(
     return float(np.mean(residual**2))
 
 
-def to_numpy(tensor: torch.Tensor) -> np.ndarray:
+def to_numpy(tensor: torch.Tensor) -> NDArray[Any]:
     return tensor.detach().cpu().numpy()
