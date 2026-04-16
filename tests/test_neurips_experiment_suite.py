@@ -6,8 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from typing import cast
+from collections.abc import Sequence
 
+import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from exp_common.experiments import _eval_model_on_dataset
 from exp_common.device import get_best_device
@@ -52,7 +57,8 @@ class ExperimentSuiteTest(unittest.TestCase):
         tapinn = build_tapinn(obs_dim=2, coord_dim=1, output_dim=2, large=False)
         obs = torch.randn(2, 5, 2)
         coords = torch.randn(2, 12, 1)
-        tapinn_out, latent = tapinn(obs, coords[:, 0, :])
+        tapinn_out = tapinn(coords[:, 0, :], obs)
+        latent = tapinn.encode(obs)
         self.assertEqual(tapinn_out.shape, (2, 2))
         self.assertEqual(latent.shape[0], 2)
 
@@ -193,15 +199,18 @@ class ExperimentSuiteTest(unittest.TestCase):
         data = generate_kuramoto_dataset([1.0], num_trajectories=1, num_points=96, t_span=(0.0, 10.0), num_oscillators=5, seed=11)
         observations, coords, targets, params, ode_metadata, coord_norm, state_norm = prepare_ode_tensors(data, observation_steps=12)
         self.assertIsNotNone(ode_metadata)
+        assert ode_metadata is not None
+        metadata = cast(dict[str, Sequence[Sequence[float]]], data.metadata)
+        natural_frequencies = np.asarray(metadata["natural_frequencies"])
         self.assertEqual(tuple(ode_metadata.shape), (1, 5))
-        self.assertTrue(torch.allclose(ode_metadata[0], torch.tensor(data.metadata["natural_frequencies"][0], dtype=torch.float32)))
+        self.assertTrue(torch.allclose(ode_metadata[0], torch.tensor(natural_frequencies[0], dtype=torch.float32)))
 
         residual = numerical_ode_residual(
             "kuramoto",
             data.times,
             data.states[0],
             float(data.params[0]),
-            metadata={"natural_frequencies": data.metadata["natural_frequencies"][0]},
+            metadata={"natural_frequencies": natural_frequencies[0]},
         )
         self.assertLess(residual, 0.75)
 
