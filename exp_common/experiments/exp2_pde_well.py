@@ -2,6 +2,7 @@ from __future__ import annotations
 # pyright: reportAny=false, reportExplicitAny=false, reportPrivateUsage=false, reportPrivateLocalImportUsage=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportUntypedFunctionDecorator=false, reportPrivateImportUsage=false, reportUnnecessaryCast=false
 
 import os
+import warnings
 from typing import Any, cast
 
 import numpy as np
@@ -349,8 +350,365 @@ def _compute_disambiguation_metric(
     return compute_disambiguation_score(embeddings, trajectory_ids.detach().cpu().tolist())
 
 
-def _run_well_systems(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    return [], []
+# ---------------------------------------------------------------------------
+# Well PDE systems (streamed from HuggingFace via PI-WELL)
+# ---------------------------------------------------------------------------
+
+_WELL_SYSTEMS = [
+    "shear_flow",
+    "euler_multi_quadrants",
+    "planet_swe",
+    "mhd",
+    "active_matter",
+    "viscoelastic_instability",
+    "helmholtz_staircase",
+]
+_WELL_MAX_TRAJECTORIES = 12
+_WELL_OBS_WINDOW = 4
+_WELL_MAX_POINTS = 4096
+_WELL_BATCH_SIZE = 4
+
+
+def _build_well_model_configs(
+    channels: int,
+    window_size: int,
+    num_points: int,
+    smoke_test: bool,
+    model_specs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build model configs for Well systems (coord_dim=3, state_dim=channels)."""
+    branch_input_dim = window_size * channels
+    fno_width = 8 if smoke_test else 32
+    fno_modes = min(4 if smoke_test else 12, max(1, num_points // 2))
+    oc_shared = {"state_dim": channels, "lstm_hidden": 64, "latent_dim": 16}
+
+    family_configs: dict[str, dict[bool, dict[str, Any]]] = {
+        "StandardPINN": {
+            False: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64},
+            True: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64, **oc_shared},
+        },
+        "HyperPINN": {
+            False: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64},
+            True: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64, **oc_shared},
+        },
+        "HyperLRPINN": {
+            False: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64, "rank": 4},
+            True: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64, "rank": 4, **oc_shared},
+        },
+        "DeepONet": {
+            False: {
+                "branch_input_dim": branch_input_dim,
+                "coord_dim": 3,
+                "output_dim": channels,
+                "hidden_dim": 64,
+                "basis_dim": 32,
+            },
+            True: {"coord_dim": 3, "output_dim": channels, "hidden_dim": 64, "basis_dim": 32, **oc_shared},
+        },
+        "FNO": {
+            False: {
+                "branch_input_dim": branch_input_dim,
+                "grid_size": num_points,
+                "output_dim": channels,
+                "width": fno_width,
+                "modes": fno_modes,
+            },
+            True: {
+                "grid_size": num_points,
+                "output_dim": channels,
+                "width": fno_width,
+                "modes": fno_modes,
+                **oc_shared,
+            },
+        },
+    }
+
+    built: dict[str, dict[str, Any]] = {}
+    for spec in model_specs:
+        family = str(spec["family"])
+        with_oc = bool(spec["with_oc"])
+        config = dict(family_configs[family][with_oc])
+        built[str(spec["name"])] = {
+            "family": family,
+            "with_oc": with_oc,
+            "training_group": _model_training_group(family),
+            "oc_variant": _oc_variant_label(with_oc),
+            "config": config,
+            "model": create_model(family, with_oc=with_oc, **config),
+        }
+    return built
+
+
+def _prepare_well_tensors(
+    adapter: Any,
+    window_size: int,
+    max_points: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Extract batched tensors from WellAdapter with optional point subsampling.
+
+    Returns (observations, coords, targets, params, trajectory_ids, original_num_points).
+    """
+    n_traj: int = adapter.data_tensor.shape[0]
+    all_coords: list[torch.Tensor] = []
+    all_targets: list[torch.Tensor] = []
+    all_obs: list[torch.Tensor] = []
+    for i in range(n_traj):
+        c, t = adapter.get_point_cloud(i)
+        o = adapter.get_observation_window(i, window_size)
+        all_coords.append(c)
+        all_targets.append(t)
+        all_obs.append(o.reshape(-1))
+
+    coords = torch.stack(all_coords)       # (N, P, 3)
+    targets = torch.stack(all_targets)      # (N, P, C)
+    observations = torch.stack(all_obs)     # (N, window_size * C)
+
+    original_num_points = coords.shape[1]
+
+    if original_num_points > max_points:
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(original_num_points, size=max_points, replace=False))
+        idx_t = torch.from_numpy(idx)
+        coords = coords[:, idx_t]
+        targets = targets[:, idx_t]
+
+    # Dummy scalar params — normalized trajectory indices
+    params = torch.arange(n_traj, dtype=torch.float32).unsqueeze(-1) / max(n_traj - 1, 1)
+    trajectory_ids = torch.arange(n_traj, dtype=torch.long)
+
+    return observations, coords, targets, params, trajectory_ids, original_num_points
+
+
+def _compute_well_physics_residual(
+    adapter: Any,
+    test_indices: Any,
+    predictions_denorm: torch.Tensor,
+    original_num_points: int,
+) -> float:
+    """Post-hoc physics residual via PI-WELL evaluators. NaN when grid is subsampled."""
+    if predictions_denorm.shape[1] != original_num_points:
+        return float("nan")
+
+    residuals: list[float] = []
+    for i, traj_idx in enumerate(test_indices):
+        try:
+            res_dict = adapter.compute_physics_residual(int(traj_idx), predictions_denorm[i])
+            if res_dict:
+                mean_res = sum(v.item() for v in res_dict.values()) / len(res_dict)
+                residuals.append(float(mean_res))
+            else:
+                residuals.append(float("nan"))
+        except Exception:
+            residuals.append(float("nan"))
+
+    valid = [r for r in residuals if not np.isnan(r)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
+def _run_well_systems(
+    *,
+    run_dir: Any,
+    device: torch.device,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run all 10 model configs on Well PDE systems with 5-seed aggregation."""
+    from ..well_adapter import WellAdapter
+
+    seeds = [seed + offset for offset in range(5)]
+    max_epochs = _resolve_max_epochs(smoke_test=False)
+    callbacks = CallbackConfig(
+        early_stopping_patience=50,
+        reduce_lr_patience=20,
+        reduce_lr_factor=0.5,
+        min_lr=1e-6,
+    )
+    model_specs = _selected_model_specs(smoke_test=False, all_configs=True)
+    model_names = [str(spec["name"]) for spec in model_specs]
+
+    seed_rows: list[dict[str, Any]] = []
+    problem_model_summaries: list[dict[str, Any]] = []
+
+    for system_name in tqdm(_WELL_SYSTEMS, desc="Well systems", leave=False):
+        try:
+            adapter = WellAdapter(system_name, max_trajectories=_WELL_MAX_TRAJECTORIES)
+        except Exception as exc:
+            warnings.warn(f"Skipping Well system {system_name}: {exc}")
+            continue
+
+        channels: int = adapter.grid_shape.channels
+        per_model_seed_data: dict[str, list[dict[str, Any]]] = {name: [] for name in model_names}
+
+        for local_seed in tqdm(seeds, desc=f"{system_name[:12]} seeds", leave=False):
+            set_global_seed(local_seed)
+
+            observations, coords, targets, params, trajectory_ids, orig_npts = _prepare_well_tensors(
+                adapter, _WELL_OBS_WINDOW, _WELL_MAX_POINTS, local_seed,
+            )
+
+            n_traj = observations.shape[0]
+            if n_traj < 3:
+                warnings.warn(f"Too few trajectories ({n_traj}) for {system_name}, skipping")
+                break
+
+            train_idx, val_idx, test_idx = _split_indices_three_way(n_traj, local_seed)
+
+            # Fit normalizers on training split only (no data leakage)
+            train_coords_raw = coords[torch.tensor(train_idx, dtype=torch.long)]
+            train_targets_raw = targets[torch.tensor(train_idx, dtype=torch.long)]
+            coord_norm = CoordNormalizer.from_coords(train_coords_raw[0])
+            state_norm = StateNormalizer.from_targets(train_targets_raw.reshape(-1, channels))
+
+            # Normalize all data
+            num_points = coords.shape[1]
+            coords_norm = coord_norm.normalize(coords.reshape(-1, 3)).reshape(coords.shape)
+            targets_norm = state_norm.normalize(targets.reshape(-1, channels)).reshape(targets.shape)
+            obs_norm = state_norm.normalize(observations.reshape(-1, channels)).reshape(observations.shape)
+
+            # Split into train / val / test
+            train_obs, train_coords_n, train_targets_n, train_params = _subset_tensors(
+                train_idx, obs_norm, coords_norm, targets_norm, params,
+            )
+            val_obs, val_coords_n, val_targets_n, val_params = _subset_tensors(
+                val_idx, obs_norm, coords_norm, targets_norm, params,
+            )
+            test_obs, test_coords_n, test_targets_n, test_params = _subset_tensors(
+                test_idx, obs_norm, coords_norm, targets_norm, params,
+            )
+            train_traj_ids = trajectory_ids[torch.tensor(train_idx, dtype=torch.long)]
+            test_traj_ids = trajectory_ids[torch.tensor(test_idx, dtype=torch.long)]
+
+            val_bundle = ValBundle(
+                observations=val_obs, coords=val_coords_n,
+                targets=val_targets_n, params=val_params,
+            )
+            active_val: ValBundle | None = val_bundle if val_obs.shape[0] > 0 else None
+            active_cb: CallbackConfig | None = callbacks if val_obs.shape[0] > 0 else None
+
+            # Build fresh models for this seed (random init)
+            well_models = _build_well_model_configs(
+                channels, _WELL_OBS_WINDOW, num_points, False, model_specs,
+            )
+            truth = state_norm.denormalize(test_targets_n).cpu().numpy()
+
+            for model_name in tqdm(list(well_models.keys()), desc=f"{system_name[:8]}/models", leave=False):
+                spec = well_models[model_name]
+                model_obj = spec["model"]
+
+                # Disable physics loss — Well PDEs not in compute_pde_residual
+                orig_phys = getattr(model_obj, "has_physics_loss", True)
+                model_obj.has_physics_loss = False
+                try:
+                    train_result = _train_pde_model(
+                        model_name, spec, system_name,
+                        train_obs, train_coords_n, train_targets_n, train_params,
+                        train_traj_ids, active_val, active_cb,
+                        device, max_epochs, _WELL_BATCH_SIZE, local_seed,
+                        coord_normalizer=coord_norm, state_normalizer=state_norm,
+                    )
+                finally:
+                    model_obj.has_physics_loss = orig_phys
+
+                predictions, inference_ms = _predict_pde_model(
+                    spec, test_obs, test_coords_n, test_params,
+                    num_points, device, state_normalizer=state_norm,
+                )
+
+                data_mse = float(np.mean((predictions - truth) ** 2))
+                relative_l2_error = compute_relative_l2_error(predictions, truth)
+
+                physics_residual = _compute_well_physics_residual(
+                    adapter, test_idx,
+                    torch.from_numpy(predictions).to(dtype=torch.float32),
+                    orig_npts,
+                )
+
+                disambiguation = _compute_disambiguation_metric(
+                    spec, test_obs, test_traj_ids, device,
+                )
+
+                row_data = {
+                    "family": spec["family"],
+                    "with_oc": spec["with_oc"],
+                    "comparison_group": spec["training_group"],
+                    "oc_variant": spec["oc_variant"],
+                    "data_mse": data_mse,
+                    "relative_l2_error": relative_l2_error,
+                    "physics_residual": physics_residual,
+                    "disambiguation_score": disambiguation,
+                    "param_count": count_parameters(model_obj),
+                    "epochs_trained": train_result.epochs_trained,
+                    "best_val_loss": train_result.best_val_loss,
+                    "seconds_per_epoch": train_result.seconds_per_epoch,
+                    "inference_ms": inference_ms,
+                }
+                per_model_seed_data[model_name].append(row_data)
+                seed_rows.append({
+                    "problem": f"well_{system_name}",
+                    "seed": local_seed,
+                    "model": model_name,
+                    **row_data,
+                })
+
+        # Aggregate across seeds per model for this system
+        for model_name in model_names:
+            rows = per_model_seed_data[model_name]
+            if not rows:
+                continue
+            data_mean, data_std = mean_std(row["data_mse"] for row in rows)
+            rel_mean, rel_std = mean_std(row["relative_l2_error"] for row in rows)
+            phys_vals = [row["physics_residual"] for row in rows if not np.isnan(row["physics_residual"])]
+            phys_mean, phys_std = mean_std(phys_vals) if phys_vals else (float("nan"), float("nan"))
+            ep_mean, ep_std = mean_std(row["epochs_trained"] for row in rows)
+            spe_mean, _ = mean_std(row["seconds_per_epoch"] for row in rows)
+            inf_mean, _ = mean_std(row["inference_ms"] for row in rows)
+            dis_vals = [float(row["disambiguation_score"]) for row in rows if row["disambiguation_score"] is not None]
+            dis_mean, dis_std = mean_std(dis_vals) if dis_vals else (0.0, 0.0)
+
+            problem_model_summaries.append({
+                "problem": f"well_{system_name}",
+                "model": model_name,
+                "family": rows[0]["family"],
+                "with_oc": rows[0]["with_oc"],
+                "comparison_group": rows[0]["comparison_group"],
+                "oc_variant": rows[0]["oc_variant"],
+                "param_count": rows[0]["param_count"],
+                "data_mse_mean": data_mean,
+                "data_mse_std": data_std,
+                "relative_l2_error_mean": rel_mean,
+                "relative_l2_error_std": rel_std,
+                "physics_residual_mean": phys_mean,
+                "physics_residual_std": phys_std,
+                "disambiguation_score_mean": dis_mean if rows[0]["with_oc"] else None,
+                "disambiguation_score_std": dis_std if rows[0]["with_oc"] else None,
+                "epochs_trained_mean": ep_mean,
+                "epochs_trained_std": ep_std,
+                "seconds_per_epoch_mean": spe_mean,
+                "inference_ms_mean": inf_mean,
+            })
+
+        # Bar charts for this system
+        sys_rows = [r for r in problem_model_summaries if r["problem"] == f"well_{system_name}"]
+        if sys_rows:
+            label = system_name.replace("_", " ").title()
+            _metrics_bar_chart(
+                [r["model"] for r in sys_rows],
+                [r["data_mse_mean"] for r in sys_rows],
+                "Data MSE",
+                f"Well: {label} — Data MSE by Model",
+                run_dir / "figures" / f"well_{system_name}_data_mse_bar.pdf",
+                comparison_groups=[r["comparison_group"] for r in sys_rows],
+            )
+            _metrics_bar_chart(
+                [r["model"] for r in sys_rows],
+                [r["relative_l2_error_mean"] for r in sys_rows],
+                "Relative L2 Error",
+                f"Well: {label} — Relative L2 by Model",
+                run_dir / "figures" / f"well_{system_name}_relative_l2_bar.pdf",
+                comparison_groups=[r["oc_variant"] for r in sys_rows],
+            )
+
+    return seed_rows, problem_model_summaries
 
 
 def _run_pde_seed_all_models(
