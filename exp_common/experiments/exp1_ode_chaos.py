@@ -714,7 +714,7 @@ def run_exp_1_ode_chaos_suite(output_root: str, device_name: str, smoke_test: bo
                 problem_name,
                 tapinn_info["truth"],
                 tapinn_info["prediction"],
-                f"{problem_name.title()} Phase-Space — TAPINN",
+                f"{problem_name.title()} Phase-Space — StandardPINN_OC",
                 run_dir / "figures" / f"{problem_name}_phase_space.pdf",
             )
 

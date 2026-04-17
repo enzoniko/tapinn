@@ -180,17 +180,17 @@ def _phase_plot(problem_name: str, truth: np.ndarray[Any, Any], pred: np.ndarray
     fig, ax = plt.subplots(figsize=(5.5, 4.0))
     if problem_name == "lorenz":
         ax.plot(truth[:, 0], truth[:, 2], label="Ground Truth", linewidth=2.0)
-        ax.plot(pred[:, 0], pred[:, 2], label="TAPINN", linewidth=2.0, linestyle="--")
+        ax.plot(pred[:, 0], pred[:, 2], label="Prediction", linewidth=2.0, linestyle="--")
         ax.set_xlabel("x")
         ax.set_ylabel("z")
     elif problem_name == "kuramoto":
         ax.plot(np.unwrap(truth[:, 0]), np.unwrap(truth[:, 1]), label="Ground Truth", linewidth=2.0)
-        ax.plot(np.unwrap(pred[:, 0]), np.unwrap(pred[:, 1]), label="TAPINN", linewidth=2.0, linestyle="--")
+        ax.plot(np.unwrap(pred[:, 0]), np.unwrap(pred[:, 1]), label="Prediction", linewidth=2.0, linestyle="--")
         ax.set_xlabel(r"$\theta_1$")
         ax.set_ylabel(r"$\theta_2$")
     else:
         ax.plot(truth[:, 0], truth[:, 1], label="Ground Truth", linewidth=2.0)
-        ax.plot(pred[:, 0], pred[:, 1], label="TAPINN", linewidth=2.0, linestyle="--")
+        ax.plot(pred[:, 0], pred[:, 1], label="Prediction", linewidth=2.0, linestyle="--")
         ax.set_xlabel("x")
         ax.set_ylabel("v")
     ax.set_title(title)
@@ -418,4 +418,4 @@ def _direct_predict_numpy(model, kind: str, obs, coords, params, device, state_n
 
 
 def _fno_predict_numpy(model, obs, points: int, device):
-    return predict_fno(model, obs, points, device)
+    return predict_fno(model, obs, points, device).detach().cpu().numpy()

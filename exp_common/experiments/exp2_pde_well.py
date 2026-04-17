@@ -511,19 +511,21 @@ def _run_well_systems(
     run_dir: Any,
     device: torch.device,
     seed: int,
+    smoke_test: bool = False,
+    all_configs: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Run all 10 model configs on Well PDE systems with 5-seed aggregation."""
     from ..well_adapter import WellAdapter
 
-    seeds = [seed + offset for offset in range(5)]
-    max_epochs = _resolve_max_epochs(smoke_test=False)
+    seeds = [seed] if smoke_test else [seed + offset for offset in range(5)]
+    max_epochs = _resolve_max_epochs(smoke_test=smoke_test)
     callbacks = CallbackConfig(
-        early_stopping_patience=50,
-        reduce_lr_patience=20,
+        early_stopping_patience=2 if smoke_test else 50,
+        reduce_lr_patience=1 if smoke_test else 20,
         reduce_lr_factor=0.5,
         min_lr=1e-6,
     )
-    model_specs = _selected_model_specs(smoke_test=False, all_configs=True)
+    model_specs = _selected_model_specs(smoke_test=smoke_test, all_configs=all_configs)
     model_names = [str(spec["name"]) for spec in model_specs]
 
     seed_rows: list[dict[str, Any]] = []
@@ -531,7 +533,7 @@ def _run_well_systems(
 
     for system_name in tqdm(_WELL_SYSTEMS, desc="Well systems", leave=False):
         try:
-            adapter = WellAdapter(system_name, max_trajectories=_WELL_MAX_TRAJECTORIES)
+            adapter = WellAdapter(system_name, max_trajectories=4 if smoke_test else _WELL_MAX_TRAJECTORIES)
         except Exception as exc:
             warnings.warn(f"Skipping Well system {system_name}: {exc}")
             continue
@@ -543,7 +545,7 @@ def _run_well_systems(
             set_global_seed(local_seed)
 
             observations, coords, targets, params, trajectory_ids, orig_npts = _prepare_well_tensors(
-                adapter, _WELL_OBS_WINDOW, _WELL_MAX_POINTS, local_seed,
+                adapter, _WELL_OBS_WINDOW, 64 if smoke_test else _WELL_MAX_POINTS, local_seed,
             )
 
             n_traj = observations.shape[0]
@@ -587,7 +589,7 @@ def _run_well_systems(
 
             # Build fresh models for this seed (random init)
             well_models = _build_well_model_configs(
-                channels, _WELL_OBS_WINDOW, num_points, False, model_specs,
+                channels, _WELL_OBS_WINDOW, num_points, smoke_test, model_specs,
             )
             truth = state_norm.denormalize(test_targets_n).cpu().numpy()
 
@@ -990,7 +992,7 @@ def run_exp_2_pde_spatiotemporal_suite(output_root: str, device_name: str, smoke
             _heatmap_triptych(
                 hd["truth"],
                 hd["prediction"],
-                f"{problem_name.replace('_', ' ').title()} Heatmaps — TAPINN",
+                f"{problem_name.replace('_', ' ').title()} Heatmaps — StandardPINN_OC",
                 run_dir / "figures" / f"{problem_name}_heatmap_triptych.pdf",
             )
 
@@ -1020,10 +1022,12 @@ def run_exp_2_pde_spatiotemporal_suite(output_root: str, device_name: str, smoke
             comparison_groups=[row["comparison_group"] for row in prob_rows],
         )
 
-    if not smoke_test:
-        well_seed_rows, well_model_summaries = _run_well_systems(run_dir=run_dir, device=device, seed=seed)
-        seed_rows.extend(well_seed_rows)
-        problem_model_summaries.extend(well_model_summaries)
+    well_seed_rows, well_model_summaries = _run_well_systems(
+        run_dir=run_dir, device=device, seed=seed,
+        smoke_test=smoke_test, all_configs=all_configs,
+    )
+    seed_rows.extend(well_seed_rows)
+    problem_model_summaries.extend(well_model_summaries)
 
     oc_benefit_rows = _build_oc_benefit_rows(problem_model_summaries)
     tapinn_summaries = [
