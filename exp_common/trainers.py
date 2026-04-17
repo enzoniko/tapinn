@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call, vmap, jacrev
 from torch.utils.data import DataLoader, TensorDataset

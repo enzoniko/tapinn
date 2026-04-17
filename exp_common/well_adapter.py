@@ -143,7 +143,7 @@ class WellAdapter:
 
     def _load_dataset(self, dataset_name: str, max_trajectories: int | None) -> torch.Tensor:
         try:
-            from the_well.data import WellDataset  # type: ignore[import-not-found]
+            from the_well.data import WellDataset  # type: ignore[import-not-found]  # PI-WELL is an optional external dependency
         except Exception as exc:  # pragma: no cover - optional path
             raise ImportError(
                 "Loading Well datasets requires the_well to be installed or data_tensor to be provided"
