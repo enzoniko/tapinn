@@ -1,0 +1,4 @@
+problem,family,oc_model,baseline_model,relative_l2_error_delta,data_mse_delta,physics_residual_delta,oc_disambiguation_score_mean
+duffing,StandardPINN,StandardPINN_OC,StandardPINN,-0.03733307417442,-0.03885132074356079,0.013605363667011261,0.0
+kuramoto,StandardPINN,StandardPINN_OC,StandardPINN,-0.021907408731831612,-0.17856597900390625,0.01249048113822937,0.0
+lorenz,StandardPINN,StandardPINN_OC,StandardPINN,-0.13712146835328876,-26.53020477294922,294.5078125,0.0

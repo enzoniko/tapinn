@@ -1,0 +1,11 @@
+name | params | forward OK | backward OK | OC detected
+StandardPINN | 177 | True | True | False
+StandardPINN_OC | 469 | True | True | True
+HyperPINN | 961 | True | True | False
+HyperPINN_OC | 1253 | True | True | True
+HyperLRPINN | 725 | True | True | False
+HyperLRPINN_OC | 1017 | True | True | True
+DeepONet | 288 | True | True | False
+DeepONet_OC | 540 | True | True | True
+FNO | 777 | True | True | False
+FNO_OC | 1053 | True | True | True

@@ -1,0 +1,234 @@
+python : 
+No linha:1 caractere:1
++ python exp_1_ode_chaos_suite.py --smoke-test --device cpu --seed 42 2 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ODE systems:   0%|          | 0/3 [00:00<?, ?it/s]
+
+duffing seeds:   0%|          | 0/1 [00:00<?, ?it/s][A
+
+
+duffin/models:   0%|          | 0/2 [00:00<?, ?it/s][A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3027, loss=0.3166, phys=0.1167, 
+\u03b1=0.119][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.2933, loss=0.3058, phys=0.0978, 
+\u03b1=0.127][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.2907, loss=0.3050, phys=0.0935, 
+\u03b1=0.153][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.2889, loss=0.3080, phys=0.0996, 
+\u03b1=0.192][A[A[A
+
+
+
+                                                                                                              [A[A[A
+
+
+duffin/models:  50%|#####     | 1/2 [00:00<00:00,  1.10it/s][A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3226, loss=0.3452, phys=0.0722, 
+\u03b1=0.314][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3117, loss=0.3460, phys=0.0717, 
+\u03b1=0.478][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3044, loss=0.3421, phys=0.0776, 
+\u03b1=0.485][A[A[A
+
+
+
+StandardPINN-duffin-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3003, loss=0.3402, phys=0.0863, 
+\u03b1=0.463][A[A[A
+
+
+
+                                                                                                              [A[A[A
+
+
+duffin/models: 100%|##########| 2/2 [00:01<00:00,  2.30it/s][A[A
+
+
+                                                            [A[A
+
+duffing seeds: 100%|##########| 1/1 [00:01<00:00,  1.07s/it][A
+
+                                                            [A
+ODE systems:  33%|###3      | 1/3 [00:02<00:04,  2.49s/it]
+
+lorenz seeds:   0%|          | 0/1 [00:00<?, ?it/s][A
+
+
+lorenz/models:   0%|          | 0/2 [00:00<?, ?it/s][A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1937, loss=1.6538, phys=16.1642, 
+\u03b1=0.090][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1487, loss=0.4286, phys=3.4254, \u03b1=0.082] 
+[A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1391, loss=0.2340, phys=1.2817, 
+\u03b1=0.074][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1437, loss=0.2841, phys=2.0920, 
+\u03b1=0.067][A[A[A
+
+
+
+                                                                                                              [A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1616, loss=0.2497, phys=0.9509, 
+\u03b1=0.093][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1597, loss=0.2395, phys=0.9326, 
+\u03b1=0.086][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1561, loss=0.2256, phys=0.8740, 
+\u03b1=0.080][A[A[A
+
+
+
+StandardPINN-lorenz-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.1531, loss=0.2177, phys=0.8212, 
+\u03b1=0.079][A[A[A
+
+
+
+                                                                                                              [A[A[A
+
+
+lorenz/models: 100%|##########| 2/2 [00:00<00:00, 13.83it/s][A[A
+
+
+                                                            [A[A
+
+lorenz seeds: 100%|##########| 1/1 [00:00<00:00,  5.53it/s][A
+
+                                                           [A
+ODE systems:  67%|######6   | 2/3 [00:03<00:01,  1.77s/it]
+
+kuramoto seeds:   0%|          | 0/1 [00:00<?, ?it/s][A
+
+
+kuramo/models:   0%|          | 0/2 [00:00<?, ?it/s][A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4692, loss=0.5132, phys=0.3053, 
+\u03b1=0.144][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4374, loss=0.4826, phys=0.2662, 
+\u03b1=0.170][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4124, loss=0.4537, phys=0.2240, 
+\u03b1=0.185][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3934, loss=0.4283, phys=0.1813, 
+\u03b1=0.192][A[A[A
+
+
+
+                                                                                                              [A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4259, loss=0.4573, phys=0.2398, 
+\u03b1=0.131][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4130, loss=0.4471, phys=0.2219, 
+\u03b1=0.153][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.4016, loss=0.4360, phys=0.2037, 
+\u03b1=0.169][A[A[A
+
+
+
+StandardPINN-kuramo-s42:   0%|          | 0/4 [00:00<?, ?it/s, data=0.3914, loss=0.4246, phys=0.1852, 
+\u03b1=0.179][A[A[A
+
+
+
+StandardPINN-kuramo-s42: 100%|##########| 4/4 [00:00<00:00, 39.32it/s, data=0.3914, loss=0.4246, phys=0.1852, 
+\u03b1=0.179][A[A[A
+
+
+
+                                                                                                                      
+[A[A[A
+
+
+kuramo/models: 100%|##########| 2/2 [00:00<00:00, 11.25it/s][A[A
+
+
+                                                            [A[A
+
+kuramoto seeds: 100%|##########| 1/1 [00:00<00:00,  3.47it/s][A
+
+                                                             [A
+ODE systems: 100%|##########| 3/3 [00:05<00:00,  1.64s/it]
+                                                          

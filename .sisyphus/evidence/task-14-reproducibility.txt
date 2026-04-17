@@ -1,0 +1,2 @@
+Exp1 reproducibility smoke check executed via run_exp_1_ode_chaos_suite('test_output/repro_check', 'cpu', smoke_test=True, seed=42).
+Result: Reproducibility check OK

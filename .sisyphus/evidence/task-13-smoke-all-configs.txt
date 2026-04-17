@@ -1,0 +1,19 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.7, pytest-7.4.4, pluggy-1.0.0 -- C:\Users\enzon\anaconda3\python.exe
+cachedir: .pytest_cache
+rootdir: D:\WORK\OCPINN\tapinn
+plugins: anyio-4.12.1, typeguard-4.4.4
+collecting ... collected 10 items
+
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[StandardPINN] PASSED [ 10%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[StandardPINN_OC] PASSED [ 20%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[HyperPINN] PASSED [ 30%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[HyperPINN_OC] PASSED [ 40%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[HyperLRPINN] PASSED [ 50%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[HyperLRPINN_OC] PASSED [ 60%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[DeepONet] PASSED [ 70%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[DeepONet_OC] PASSED [ 80%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[FNO] PASSED [ 90%]
+tests/test_smoke_all_configs.py::test_smoke_all_model_configs[FNO_OC] PASSED [100%]
+
+============================= 10 passed in 1.47s ==============================
