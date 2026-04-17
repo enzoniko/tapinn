@@ -515,12 +515,9 @@ def _run_well_systems(
     all_configs: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Run all 10 model configs on Well PDE systems with 5-seed aggregation."""
-    # Smoke tests skip Well systems entirely — they require HuggingFace downloads
-    # that are not suitable for fast offline CI.  The test assertions only rely
-    # on PDE-system outputs (6 rows = 3 PDEs × 2 models), so returning empty
-    # lists here keeps the 63/63 suite green without network access.
-    if smoke_test:
-        return [], []
+    # In smoke_test mode, use minimal config: single seed, fewer trajectories, fewer epochs.
+    # The try/except around WellAdapter initialization (lines 541-546) handles
+    # network/HuggingFace failures gracefully with warnings.
 
     from ..well_adapter import WellAdapter
 
@@ -535,10 +532,14 @@ def _run_well_systems(
     model_specs = _selected_model_specs(smoke_test=smoke_test, all_configs=all_configs)
     model_names = [str(spec["name"]) for spec in model_specs]
 
+    # In smoke_test mode, only run 1 Well system (shear_flow) to keep runtime short.
+    # It alone verifies the HuggingFace path and training pipeline work.
+    well_systems_to_run = ["shear_flow"] if smoke_test else _WELL_SYSTEMS
+
     seed_rows: list[dict[str, Any]] = []
     problem_model_summaries: list[dict[str, Any]] = []
 
-    for system_name in tqdm(_WELL_SYSTEMS, desc="Well systems", leave=False):
+    for system_name in tqdm(well_systems_to_run, desc="Well systems", leave=False):
         try:
             adapter = WellAdapter(system_name, max_trajectories=4 if smoke_test else _WELL_MAX_TRAJECTORIES)
         except Exception as exc:

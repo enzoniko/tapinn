@@ -84,8 +84,10 @@ class Exp2UpdatedTest(unittest.TestCase):
 
         payload_from_disk = json.loads(results_path.read_text(encoding="utf-8"))
         self.assertEqual(payload_from_disk["models"], ["StandardPINN", "StandardPINN_OC"])
-        self.assertEqual(len(payload_from_disk["summary"]), 6)
-        self.assertEqual(len(payload_from_disk["oc_benefit"]), 3)
+        # Expected: 3 PDEs × 2 models = 6, + 1 Well × 2 models (shear_flow in smoke) = 8 total
+        self.assertEqual(len(payload_from_disk["summary"]), 8)
+        # OC benefit: 3 PDEs + 1 Well = 4
+        self.assertEqual(len(payload_from_disk["oc_benefit"]), 4)
 
 
 if __name__ == "__main__":
