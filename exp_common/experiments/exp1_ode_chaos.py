@@ -34,6 +34,7 @@ from .common import (
     _fno_predict_numpy,
     _measure_inference_ms,
     _phase_plot,
+    _save_plot_data,
     _split_indices_three_way,
     _subset_optional_tensor,
     _subset_tensors,
@@ -525,6 +526,18 @@ def _multi_model_phase_plot(
     fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     save_figure(fig, path)
+    _save_plot_data(path, {
+        "problem_name": problem_name,
+        "title": title,
+        "models": {
+            name: {
+                "truth": info["truth"],
+                "prediction": info["prediction"],
+                "relative_l2_error": info["relative_l2_error"],
+            }
+            for name, info in model_results.items()
+        },
+    })
 
 
 def _metrics_bar_chart(
@@ -552,6 +565,7 @@ def _metrics_bar_chart(
     ax.set_title(title)
     ax.tick_params(axis="x", rotation=20)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "ylabel": ylabel, "model_names": model_names, "values": values, "comparison_groups": comparison_groups})
 
 
 def _param_vs_residual_scatter(
@@ -569,6 +583,7 @@ def _param_vs_residual_scatter(
     ax.set_ylabel("Physics Residual")
     ax.set_title(title)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "points": model_results_flat})
 
 
 def _build_oc_benefit_rows(problem_model_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:

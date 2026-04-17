@@ -163,10 +163,11 @@ class WellAdapter:
             ) from exc
 
         hf_name = _HF_DATASET_NAME_MAP.get(dataset_name, dataset_name)
+        # Build the HF URI with explicit POSIX separators — os.path.join emits
+        # backslashes on Windows which fsspec cannot parse as a valid hf:// path.
+        hf_data_path = "hf://datasets/polymathic-ai/" + hf_name + "/data/train"
         dataset = WellDataset(
-            well_base_path="hf://datasets/polymathic-ai/",
-            well_dataset_name=hf_name,
-            well_split_name="train",
+            path=hf_data_path,
             full_trajectory_mode=True,
             n_steps_input=0,
             return_grid=False,

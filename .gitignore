@@ -4,6 +4,16 @@ neurips_results/**/run_full.log
 neurips_results/**/run_multi_prob.log
 *.log
 
+# Orchestration
+.sisyphus/
+
+# Test Artifacts
+neurips_results_quick_test/
+test_f3_output/
+
+# Paper drafts
+*.tex
+
 # Python Caches
 __pycache__/
 *.py[cod]

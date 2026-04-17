@@ -35,6 +35,7 @@ from .common import (
     _aggregate_ode_metrics,
     _aggregate_pde_metrics,
     _measure_inference_ms,
+    _save_plot_data,
     _split_indices_three_way,
     _subset_optional_tensor,
     _subset_tensors,
@@ -728,6 +729,7 @@ def _param_vs_residual_scatter(model_rows: list[dict[str, Any]], title: str, pat
     ax.set_ylabel("Physics Residual")
     ax.set_title(title)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "rows": model_rows})
 
 
 def _prepare_duffing_dataset_for_exp3(smoke_test: bool, seed: int):

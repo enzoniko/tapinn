@@ -547,7 +547,7 @@ def _compute_val_loss_direct(
             )
             pred = model.decode(flat_coords, repeated_latent)
     else:
-        repeated_params = params.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
+        repeated_params = params.reshape(params.shape[0]).unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
         if model_kind == "deeponet":
             branch_input = obs.reshape(obs.shape[0], -1)
             repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
@@ -726,7 +726,7 @@ def train_tapinn(
             phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
             flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
             expanded_phys_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(-1, latent.shape[-1])
-            phys_param = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
+            phys_param = param_batch.reshape(param_batch.shape[0]).unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
             phys_pred = model.decode(flat_phys_coords, expanded_phys_latent)
 
             if flat_phys_coords.shape[-1] == 1:
@@ -989,7 +989,7 @@ def train_direct_model(
                     pred = model.decode(flat_data_coords, repeated_latent)
             else:
                 metric_loss = data_coords.sum() * 0.0
-                repeated_params = param_batch.unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
+                repeated_params = param_batch.reshape(param_batch.shape[0]).unsqueeze(1).expand(-1, data_coords.shape[1]).reshape(-1)
                 if model_kind == "deeponet":
                     branch_input = obs_batch.reshape(obs_batch.shape[0], -1)
                     repeated_branch = branch_input.unsqueeze(1).expand(-1, data_coords.shape[1], -1).reshape(
@@ -1006,7 +1006,7 @@ def train_direct_model(
             if has_physics:
                 phys_coords, _ = _sample_coord_subset(coord_batch, target_batch, max_phys_points)
                 flat_phys_coords = phys_coords.reshape(-1, coord_batch.shape[-1]).detach().clone().requires_grad_(True)
-                phys_params = param_batch.unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
+                phys_params = param_batch.reshape(param_batch.shape[0]).unsqueeze(1).expand(-1, phys_coords.shape[1]).reshape(-1)
                 if has_oc:
                     assert latent is not None
                     repeated_latent = latent.unsqueeze(1).expand(-1, phys_coords.shape[1], -1).reshape(
@@ -1264,7 +1264,7 @@ def predict_direct(
     """
     model.eval()
     flat_coords = coords.to(device).reshape(-1, coords.shape[-1])
-    repeated_params = params.to(device).unsqueeze(1).expand(-1, coords.shape[1]).reshape(-1)
+    repeated_params = params.to(device).reshape(params.shape[0]).unsqueeze(1).expand(-1, coords.shape[1]).reshape(-1)
     if model_kind == "deeponet":
         branch_input = observations.reshape(observations.shape[0], -1).to(device)
         repeated_branch = branch_input.unsqueeze(1).expand(-1, coords.shape[1], -1).reshape(-1, branch_input.shape[-1])

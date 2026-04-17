@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -63,6 +64,28 @@ except Exception:  # pragma: no cover - fallback only
 
 _EXP_EPOCHS_ENV = "TAPINN_EXPERIMENT_EPOCHS"
 _EXP_ALL_CONFIGS_ENV = "TAPINN_EXPERIMENT_ALL_CONFIGS"
+
+
+def _to_serializable(obj: object) -> object:
+    """Recursively convert numpy types to JSON-serializable Python types."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v) for v in obj]
+    return obj
+
+
+def _save_plot_data(path: Path, data: dict[str, object]) -> None:
+    """Write a companion .plotdata.json file alongside the plot PDF."""
+    json_path = path.with_name(path.stem + ".plotdata.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(_to_serializable(data), f)
 
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
@@ -196,6 +219,7 @@ def _phase_plot(problem_name: str, truth: np.ndarray[Any, Any], pred: np.ndarray
     ax.set_title(title)
     ax.legend(loc="best")
     save_figure(fig, path)
+    _save_plot_data(path, {"problem_name": problem_name, "title": title, "truth": truth, "pred": pred})
 
 
 def _heatmap_triptych(exact: np.ndarray[Any, Any], pred: np.ndarray[Any, Any], title: str, path: Path) -> None:
@@ -210,6 +234,7 @@ def _heatmap_triptych(exact: np.ndarray[Any, Any], pred: np.ndarray[Any, Any], t
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.suptitle(title)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "exact": exact, "pred": pred})
 
 
 def _line_plot(x_values, y_values, x_label: str, y_label: str, title: str, path: Path) -> None:
@@ -220,6 +245,7 @@ def _line_plot(x_values, y_values, x_label: str, y_label: str, title: str, path:
     plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.savefig(path)
+    _save_plot_data(path, {"title": title, "x_label": x_label, "y_label": y_label, "x_values": x_values, "y_values": y_values})
     plt.close()
 
 
@@ -246,6 +272,7 @@ def _multi_line_plot(rows: list[dict[str, object]], x_key: str, y_key: str, hue_
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig(path)
+    _save_plot_data(path, {"title": title, "x_key": x_key, "y_key": y_key, "hue_key": hue_key, "rows": rows})
     plt.close()
 
 
@@ -258,6 +285,7 @@ def _scatter_plot(points: list[dict[str, float]], title: str, path: Path) -> Non
     ax.set_ylabel("Physics Residual")
     ax.set_title(title)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "points": points})
 
 
 def _bar_plot(labels: list[str], values: list[float], title: str, path: Path) -> None:
@@ -266,6 +294,7 @@ def _bar_plot(labels: list[str], values: list[float], title: str, path: Path) ->
     ax.set_ylabel("Generalization Gap (MSE)")
     ax.set_title(title)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "labels": labels, "values": values})
 
 
 def _spectrum_plot(records: list[dict[str, object]], title: str, path: Path, problem_name: str | None = None) -> None:
@@ -299,6 +328,7 @@ def _spectrum_plot(records: list[dict[str, object]], title: str, path: Path, pro
     ax.set_title(title)
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "problem_name": problem_name, "records": records})
 
 
 def _condition_plot(records: list[dict[str, object]], title: str, path: Path, problem_name: str | None = None) -> None:
@@ -347,6 +377,7 @@ def _condition_plot(records: list[dict[str, object]], title: str, path: Path, pr
     ax.set_title(title)
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     save_figure(fig, path)
+    _save_plot_data(path, {"title": title, "problem_name": problem_name, "records": records})
 
 
 def _final_conditioning_summary_plot(records: list[dict[str, object]], path: Path) -> None:
@@ -400,6 +431,7 @@ def _final_conditioning_summary_plot(records: list[dict[str, object]], path: Pat
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     fig.tight_layout()
     save_figure(fig, path)
+    _save_plot_data(path, {"records": records})
 
 
 def _measure_inference_ms(fn, sample_count: int, *args) -> tuple[np.ndarray[Any, Any], float]:
