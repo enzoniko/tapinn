@@ -33,6 +33,19 @@ def _load_residual_classes() -> dict[str, type]:
 
 RESIDUAL_REGISTRY = _load_residual_classes()
 
+# Maps internal residual registry keys to canonical HuggingFace dataset names
+# used by WellDataset(well_base_path="hf://datasets/polymathic-ai/", well_dataset_name=...).
+_HF_DATASET_NAME_MAP: dict[str, str] = {
+    "shear_flow": "shear_flow",
+    "euler_multi_quadrants": "euler_multi_quadrants_openBC",
+    "planet_swe": "planetswe",
+    "planetswe": "planetswe",
+    "mhd": "MHD_64",
+    "active_matter": "active_matter",
+    "viscoelastic_instability": "viscoelastic_instability",
+    "helmholtz_staircase": "helmholtz_staircase",
+}
+
 
 @dataclass(frozen=True)
 class _GridShape:
@@ -149,10 +162,16 @@ class WellAdapter:
                 "Loading Well datasets requires the_well to be installed or data_tensor to be provided"
             ) from exc
 
+        hf_name = _HF_DATASET_NAME_MAP.get(dataset_name, dataset_name)
         dataset = WellDataset(
             well_base_path="hf://datasets/polymathic-ai/",
-            well_dataset_name=dataset_name,
+            well_dataset_name=hf_name,
             well_split_name="train",
+            full_trajectory_mode=True,
+            n_steps_input=0,
+            return_grid=False,
+            use_normalization=False,
+            restrict_num_trajectories=max_trajectories,
         )
 
         limit = max_trajectories or len(dataset)
@@ -171,13 +190,17 @@ class WellAdapter:
         if isinstance(sample, torch.Tensor):
             tensor = sample
         elif isinstance(sample, dict):
-            for key in ("targets", "field", "fields", "data", "output"):
+            # WellDataset returns {"output_fields": Tensor, "input_fields": Tensor, ...}.
+            # Also support legacy keys for backward compatibility with raw tensor dicts.
+            for key in ("output_fields", "input_fields", "targets", "field", "fields", "data", "output"):
                 value = sample.get(key)
-                if isinstance(value, torch.Tensor):
+                if isinstance(value, torch.Tensor) and value.numel() > 0:
                     tensor = value
                     break
             else:
-                raise ValueError("Unable to locate tensor field in Well sample")
+                raise ValueError(
+                    f"Unable to locate tensor field in Well sample (keys: {list(sample.keys())})"
+                )
         else:  # pragma: no cover - optional path
             raise ValueError(f"Unsupported Well sample type: {type(sample)!r}")
 
